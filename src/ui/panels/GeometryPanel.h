@@ -3,6 +3,7 @@
 #include "ui/panels/PanelBase.h"
 
 class QComboBox;
+class QPushButton;
 class QLabel;
 
 namespace re {
@@ -12,6 +13,8 @@ class GeometryPanel : public PanelBase {
 public:
     explicit GeometryPanel(EditorSession* session, QWidget* parent = nullptr);
     void setCropAspect(CropAspect a);
+public slots:
+    void setActiveTool(Tool t);
 signals:
     void toolRequested(Tool tool);
     void cropAspectChanged(CropAspect aspect);
@@ -20,6 +23,9 @@ protected:
     void onParamsChanged(const EditParams& p) override;
 private:
     QComboBox* aspect_;
+    QPushButton* straightenBtn_;
+    QPushButton* handlesBtn_;
+    QPushButton* cropBtn_;
     QLabel* cropInfo_;
 };
 

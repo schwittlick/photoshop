@@ -18,6 +18,8 @@ GeometryPanel::GeometryPanel(EditorSession* session, QWidget* parent) : PanelBas
         ->setSuffix(QStringLiteral("°"));
     auto* rotRow = new QHBoxLayout();
     auto* straighten = new QPushButton(QStringLiteral("Straighten tool"), this);
+    straighten->setCheckable(true);
+    straightenBtn_ = straighten;
     straighten->setToolTip(QStringLiteral("Drag a line along a horizon or vertical edge (A)"));
     rotRow->addWidget(straighten);
     rotRow->addStretch();
@@ -31,6 +33,8 @@ GeometryPanel::GeometryPanel(EditorSession* session, QWidget* parent) : PanelBas
     addSlider(persp->contentLayout(), QStringLiteral("Horizontal"), -100, 100, 1, 0, [](EditParams& p) -> float& { return p.geom.perspHorizontal; });
     auto* pRow = new QHBoxLayout();
     auto* handles = new QPushButton(QStringLiteral("Corner handles"), this);
+    handles->setCheckable(true);
+    handlesBtn_ = handles;
     handles->setToolTip(QStringLiteral("Drag the four corners of the frame freely (P)"));
     auto* resetP = new QPushButton(QStringLiteral("Reset"), this);
     pRow->addWidget(handles);
@@ -62,6 +66,8 @@ GeometryPanel::GeometryPanel(EditorSession* session, QWidget* parent) : PanelBas
     crop->addWidget(cropInfo_);
     auto* cRow = new QHBoxLayout();
     auto* cropTool = new QPushButton(QStringLiteral("Crop tool"), this);
+    cropTool->setCheckable(true);
+    cropBtn_ = cropTool;
     cropTool->setToolTip(QStringLiteral("Drag the crop rectangle and its handles (C)"));
     auto* resetC = new QPushButton(QStringLiteral("Reset"), this);
     cRow->addWidget(cropTool);
@@ -86,6 +92,14 @@ GeometryPanel::GeometryPanel(EditorSession* session, QWidget* parent) : PanelBas
     lay->addWidget(crop);
     lay->addStretch();
     onParamsChanged(session_->params());
+}
+
+void GeometryPanel::setActiveTool(Tool t) {
+    for (auto* b : {straightenBtn_, handlesBtn_, cropBtn_}) b->blockSignals(true);
+    straightenBtn_->setChecked(t == Tool::Straighten);
+    handlesBtn_->setChecked(t == Tool::Perspective);
+    cropBtn_->setChecked(t == Tool::Crop);
+    for (auto* b : {straightenBtn_, handlesBtn_, cropBtn_}) b->blockSignals(false);
 }
 
 void GeometryPanel::setCropAspect(CropAspect a) {

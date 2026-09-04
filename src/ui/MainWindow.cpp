@@ -105,10 +105,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         if (!ok) QMessageBox::critical(this, QStringLiteral("OpenGL"), QStringLiteral("Could not initialise the GPU pipeline:\n%1").arg(info));
         else statusInfo_->setToolTip(QStringLiteral("GPU: %1").arg(info));
     });
-    connect(basic_, &BasicPanel::whiteBalancePickerRequested, this, [this] { canvas_->setTool(Tool::WhiteBalance); });
+    connect(basic_, &BasicPanel::whiteBalancePickerRequested, this, [this] { canvas_->setTool(canvas_->tool() == Tool::WhiteBalance ? Tool::Hand : Tool::WhiteBalance); });
     connect(lens_, &LensPanel::autoCropRequested, canvas_, &CanvasWidget::autoCropToFit);
     connect(geometry_, &GeometryPanel::autoCropRequested, canvas_, &CanvasWidget::autoCropToFit);
-    connect(geometry_, &GeometryPanel::toolRequested, canvas_, &CanvasWidget::setTool);
+    connect(geometry_, &GeometryPanel::toolRequested, this, [this](Tool t) { canvas_->setTool(canvas_->tool() == t ? Tool::Hand : t); });
+    connect(canvas_, &CanvasWidget::toolChanged, geometry_, &GeometryPanel::setActiveTool);
     connect(geometry_, &GeometryPanel::cropAspectChanged, canvas_, &CanvasWidget::setCropAspect);
 
     qApp->installEventFilter(this);
@@ -259,6 +260,11 @@ void MainWindow::buildMenusAndToolbar() {
         toolActs_[i++] = a;
     }
     toolActs_[0]->setChecked(true);
+    auto* esc = new QAction(this);  // window-wide: works whichever panel widget has focus
+    esc->setShortcut(QKeySequence(Qt::Key_Escape));
+    esc->setShortcutContext(Qt::WindowShortcut);
+    addAction(esc);
+    connect(esc, &QAction::triggered, this, [this] { canvas_->setTool(Tool::Hand); });
     tb->addSeparator();
     tb->addAction(clipAct_);
     tb->addAction(beforeAct_);
@@ -422,8 +428,8 @@ bool MainWindow::runExport(const ExportSettings& s, bool interactive, QString* e
     return true;
 }
 
-void MainWindow::runHeadless(const QString& screenshotPath, const QString& exportPath, bool disableLens, bool demo) {
-    connect(session_, &EditorSession::loadFinished, this, [this, screenshotPath, exportPath, disableLens, demo](bool ok, const QString& err) {
+void MainWindow::runHeadless(const QString& screenshotPath, const QString& exportPath, bool disableLens, bool demo, const QString& toolName) {
+    connect(session_, &EditorSession::loadFinished, this, [this, screenshotPath, exportPath, disableLens, demo, toolName](bool ok, const QString& err) {
         if (!ok) { fprintf(stderr, "load failed: %s\n", err.toUtf8().constData()); QCoreApplication::exit(2); return; }
         fprintf(stdout, "loaded: %s\nlens: %s\n", session_->imageDescription().toUtf8().constData(), session_->lensStatus().toUtf8().constData());
         if (disableLens) { EditParams p = session_->params(); p.lens.lensAuto = false; session_->setParams(p, false); }
@@ -436,9 +442,16 @@ void MainWindow::runHeadless(const QString& screenshotPath, const QString& expor
             p.geom.perspVertical = 15;
             p.geom.cropNorm = QRectF(0.12, 0.08, 0.72, 0.8);
             session_->setParams(p, false);
+            p.geom.corners[0] = QVector2D(0.06f, 0.04f);
+            p.geom.corners[1] = QVector2D(-0.04f, 0.05f);
+            session_->setParams(p, false);
             canvas_->setTool(Tool::Crop);
             clipAct_->setChecked(true);
         }
+        if (toolName == "perspective") canvas_->setTool(Tool::Perspective);
+        else if (toolName == "crop") canvas_->setTool(Tool::Crop);
+        else if (toolName == "straighten") canvas_->setTool(Tool::Straighten);
+        else if (toolName == "hand") canvas_->setTool(Tool::Hand);
         QTimer::singleShot(800, this, [this, screenshotPath, exportPath] {
             int rc = 0;
             if (!screenshotPath.isEmpty()) {

@@ -38,18 +38,20 @@ int main(int argc, char** argv) {
 
     QString file, screenshot, exportPath;
     bool noLens = false, demo = false;
+    QString toolName;
     const QStringList args = app.arguments();
     for (int i = 1; i < args.size(); ++i) {
         if (args[i] == "--screenshot" && i + 1 < args.size()) screenshot = args[++i];
         else if (args[i] == "--export" && i + 1 < args.size()) exportPath = args[++i];
         else if (args[i] == "--no-lens") noLens = true;
         else if (args[i] == "--demo") demo = true;
+        else if (args[i] == "--tool" && i + 1 < args.size()) toolName = args[++i];
         else if (!args[i].startsWith("--")) file = args[i];
     }
     re::MainWindow w;
     w.resize(1500, 950);
     w.show();
-    if (!screenshot.isEmpty() || !exportPath.isEmpty() || demo) w.runHeadless(screenshot, exportPath, noLens, demo);
+    if (!screenshot.isEmpty() || !exportPath.isEmpty() || demo) w.runHeadless(screenshot, exportPath, noLens, demo, toolName);
     if (!file.isEmpty()) w.openFile(file);
     return app.exec();
 }

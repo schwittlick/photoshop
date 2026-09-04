@@ -652,17 +652,18 @@ void CanvasWidget::drawOverlays(QPainter& p) {
         auto quad = geom::perspectiveQuad(params.geom);
         QPolygonF poly;
         for (int i = 0; i < 4; ++i) poly << frameToScreen(fg.rotateFwd(quad[i]));
-        p.setPen(QPen(QColor(120, 200, 255, 220), 1.5));
         p.setBrush(Qt::NoBrush);
+        QRectF fr(frameToScreen({0, 0}), frameToScreen({1, 1}));
+        p.setPen(QPen(QColor(255, 255, 255, 90), 1, Qt::DashLine));
+        p.drawRect(fr);
+        p.setPen(QPen(QColor(120, 200, 255, 220), 1.5));
         p.drawPolygon(poly);
         for (int i = 0; i < 4; ++i) {
             p.setPen(QPen(Qt::black, 1));
             p.setBrush(i == perspHandle_ && drag_ == Drag::Perspective ? QColor(255, 200, 60) : QColor(120, 200, 255));
             p.drawEllipse(poly[i], 6, 6);
         }
-        QRectF fr(frameToScreen({0, 0}), frameToScreen({1, 1}));
-        p.setPen(QPen(QColor(255, 255, 255, 90), 1, Qt::DashLine));
-        p.drawRect(fr);
+        p.setBrush(Qt::NoBrush);
     }
     if (beforeAfter_) {
         p.setPen(Qt::white);
