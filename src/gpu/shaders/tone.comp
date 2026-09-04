@@ -1,0 +1,149 @@
+#version 430
+#include "common.glsl"
+// Stage 3: tone (all on linear working-space data, pivot 0.18), curve, saturation/vibrance,
+// output transform, histogram accumulation and clipping overlay.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D uStage2;
+layout(binding = 2) uniform sampler1D uCurve;   // RGBA32F, per-channel LUTs in rgb
+layout(binding = 3) uniform sampler3D uLut3D;   // ICC display LUT
+#ifdef FLOAT_OUTPUT
+layout(rgba32f, binding = 0) uniform writeonly image2D uDst;
+#else
+layout(rgba8, binding = 0) uniform writeonly image2D uDst;
+#endif
+layout(std430, binding = 0) buffer Hist { uint bins[1028]; };  // r g b l (256 each), total, clipHigh, clipLow, pad
+
+uniform ivec2 uSize;
+uniform int uPassthrough;
+uniform float uExposure;              // linear multiplier
+uniform float uBlack, uWhite;         // linear input range remap
+uniform float uHighlights, uShadows;  // -1..1
+uniform float uContrastK;             // log-space slope at the pivot
+uniform float uSaturation, uVibrance; // -1..1
+uniform int uCurveEnabled;
+uniform int uCurveN;
+uniform int uOutputMode;              // 0 sRGB display, 1 LUT display, 2 working linear
+uniform int uLutN;
+uniform mat3 uWorkToSRGB, uSRGBToWork;
+uniform int uClipOverlay;
+uniform int uHistogram;
+
+shared uint sh[1028];
+
+const float PIVOT = 0.18;
+// Oklab (Ottosson), column-major.
+const mat3 M1 = mat3(0.4122214708, 0.2119034982, 0.0883024619,
+                     0.5363325363, 0.6806995451, 0.2817188376,
+                     0.0514459929, 0.1073969566, 0.6299787005);
+const mat3 M1inv = mat3(4.0767416621, -1.2684380046, -0.0041960863,
+                        -3.3077115913, 2.6097574011, -0.7034186147,
+                        0.2309699292, -0.3413193965, 1.7076147010);
+const mat3 M2 = mat3(0.2104542553, 1.9779984951, 0.0259040371,
+                     0.7936177850, -2.4285922050, 0.7827717662,
+                     -0.0040720468, 0.4505937099, -0.8086757660);
+const mat3 M2inv = mat3(1.0, 1.0, 1.0,
+                        0.3963377774, -0.1055613458, -0.0894841775,
+                        0.2158037573, -0.0638541728, -1.2914855480);
+
+vec3 toOklab(vec3 work) {
+    vec3 lms = M1 * (uWorkToSRGB * work);
+    lms = sign(lms) * pow(abs(lms), vec3(1.0 / 3.0));
+    return M2 * lms;
+}
+vec3 fromOklab(vec3 lab) {
+    vec3 lms = M2inv * lab;
+    lms = lms * lms * lms;
+    return uSRGBToWork * (M1inv * lms);
+}
+
+vec3 tonemap(vec3 c) {
+    c *= uExposure;
+    c = (c - uBlack) / (uWhite - uBlack);
+    // Highlights / shadows: luminance-keyed gain with smooth log-luminance masks (no hard threshold).
+    float Y = max(dot(c, vec3(0.2627, 0.6780, 0.0593)), 1e-6);
+    float l = log2(Y / PIVOT);
+    float g = exp2(uHighlights * 1.5 * smoothstep(0.0, 3.0, l) + uShadows * 1.5 * smoothstep(0.0, 4.0, -l));
+    c *= g;
+    // Contrast: S-curve in log space around the pivot, linear extension beyond +-8 stops.
+    if (uContrastK != 1.0) {
+        vec3 lc = log2(max(c, vec3(1e-7)) / PIVOT) / 8.0;
+        vec3 a = abs(lc);
+        vec3 s = lc * uContrastK / (1.0 + (uContrastK - 1.0) * min(a, vec3(1.0)));
+        vec3 d = mix(s, lc, step(vec3(1.0), a));
+        c = PIVOT * exp2(d * 8.0);
+    }
+    // Tone curve in a display-referred encoding.
+    if (uCurveEnabled != 0) {
+        vec3 e = srgbOETF3(c);
+        vec3 tc = e * (float(uCurveN - 1) / float(uCurveN)) + 0.5 / float(uCurveN);
+        e = vec3(texture(uCurve, tc.r).r, texture(uCurve, tc.g).g, texture(uCurve, tc.b).b);
+        c = srgbEOTF3(e);
+    }
+    // Saturation scales chroma in Oklab; vibrance does the same with the gain attenuated by existing chroma.
+    if (uSaturation != 0.0 || uVibrance != 0.0) {
+        vec3 lab = toOklab(c);
+        float C = length(lab.yz);
+        float gain = (1.0 + uSaturation) * (1.0 + uVibrance * (1.0 - smoothstep(0.0, 0.25, C)));
+        lab.yz *= max(gain, 0.0);
+        c = fromOklab(lab);
+    }
+    return c;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    uint lid = gl_LocalInvocationIndex;
+    if (uHistogram != 0) {
+        for (uint i = lid; i < 1028u; i += 256u) sh[i] = 0u;
+        barrier();
+    }
+    bool inside = p.x < uSize.x && p.y < uSize.y;
+    if (inside) {
+        vec4 src = texelFetch(uStage2, p, 0);
+        vec4 outv;
+        if (uPassthrough != 0) {
+            outv = src;
+        } else {
+            vec3 c = tonemap(src.rgb);
+            vec3 enc;
+            if (uOutputMode == 0) {
+                enc = srgbOETF3(uWorkToSRGB * c);
+            } else if (uOutputMode == 1) {
+                vec3 e = srgbOETF3(c);
+                vec3 tc = e * (float(uLutN - 1) / float(uLutN)) + 0.5 / float(uLutN);
+                enc = texture(uLut3D, tc).rgb;
+            } else {
+                enc = c;
+            }
+            if (uOutputMode != 2 && src.a > 0.5) {
+                bool hi = any(greaterThanEqual(enc, vec3(254.5 / 255.0)));
+                bool lo = all(lessThanEqual(enc, vec3(0.5 / 255.0)));
+                if (uHistogram != 0) {
+                    ivec3 bi = ivec3(clamp(enc * 255.0 + 0.5, 0.0, 255.0));
+                    float lum = dot(enc, vec3(0.2126, 0.7152, 0.0722));
+                    atomicAdd(sh[bi.r], 1u);
+                    atomicAdd(sh[256 + bi.g], 1u);
+                    atomicAdd(sh[512 + bi.b], 1u);
+                    atomicAdd(sh[768 + int(clamp(lum * 255.0 + 0.5, 0.0, 255.0))], 1u);
+                    atomicAdd(sh[1024], 1u);
+                    if (hi) atomicAdd(sh[1025], 1u);
+                    if (lo) atomicAdd(sh[1026], 1u);
+                }
+                if (uClipOverlay != 0) {
+                    if (hi) enc = vec3(1.0, 0.0, 0.0);
+                    else if (lo) enc = vec3(0.0, 0.0, 1.0);
+                }
+            }
+            outv = vec4(enc, src.a);
+        }
+        imageStore(uDst, p, outv);
+    }
+    if (uHistogram != 0) {
+        barrier();
+        for (uint i = lid; i < 1028u; i += 256u) {
+            uint v = sh[i];
+            if (v != 0u) atomicAdd(bins[i], v);
+        }
+    }
+}

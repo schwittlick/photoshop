@@ -1,0 +1,177 @@
+#version 430
+// Stage 2: the single warp pass. For every output pixel the inverse mapping
+//   output -> crop rect -> frame -> rotation^-1 -> perspective^-1 -> manual ptlens/CA -> lensfun grid -> source
+// is composed and the stage-1 texture is resampled exactly once, per colour channel.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D uStage1;      // linear, clamp to edge
+layout(binding = 1) uniform sampler2DArray uGrid;   // lensfun displacement grid, layers R G B
+#ifdef DEBUG_COORDS
+layout(rgba32f, binding = 0) uniform writeonly image2D uDst;
+#else
+layout(rgba16f, binding = 0) uniform writeonly image2D uDst;
+#endif
+
+uniform ivec2 uOutSize;
+uniform vec2 uRegionOrigin, uRegionSize;  // crop-normalised
+uniform vec4 uCrop;                       // frame-normalised x, y, w, h
+uniform float uAspect;                    // source W/H
+uniform vec2 uRot;                        // cos, sin of the rotation (positive = clockwise on screen)
+uniform mat3 uInvPersp;
+uniform int uUseGrid;
+uniform int uGridN;
+uniform float uGridMargin;
+uniform float uGridStrength;              // scales the profile distortion displacement
+uniform int uGridCA;                      // apply the per-channel part of the grid
+uniform vec3 uManualDist;                 // ptlens a, b, c
+uniform vec2 uCaScale;                    // radial scale for R and B (1 = none)
+uniform int uChannelsDiffer;
+uniform int uSampler;                     // 0 bilinear, 1 Catmull-Rom, 2 Lanczos3
+uniform vec2 uSrcSize;                    // stage-1 texture size in texels
+
+vec2 rotateInv(vec2 q) {
+    vec2 c = vec2((q.x - 0.5) * uAspect, q.y - 0.5);
+    vec2 r = vec2(c.x * uRot.x + c.y * uRot.y, -c.x * uRot.y + c.y * uRot.x);
+    return vec2(r.x / uAspect + 0.5, r.y + 0.5);
+}
+
+vec2 applyH(mat3 H, vec2 q) {
+    vec3 h = H * vec3(q, 1.0);
+    return h.xy / h.z;
+}
+
+// Keep in sync with geom::manualDistortion() on the CPU.
+vec2 manualDist(vec2 q, float chScale) {
+    float hdl = 0.5 * sqrt(uAspect * uAspect + 1.0);
+    vec2 c = vec2((q.x - 0.5) * uAspect, q.y - 0.5) / hdl;
+    float r = length(c);
+    float a = uManualDist.x, b = uManualDist.y, cc = uManualDist.z;
+    float d = 1.0 - a - b - cc;
+    float s = ((a * r + b) * r + cc) * r + d;
+    c *= s * chScale;
+    return vec2(c.x * hdl / uAspect + 0.5, c.y * hdl + 0.5);
+}
+
+vec2 gridFetch(vec2 q, int layer) {
+    vec2 t = (q + uGridMargin) / (1.0 + 2.0 * uGridMargin);
+    t = t * (float(uGridN - 1) / float(uGridN)) + 0.5 / float(uGridN);  // node i at texel centre i
+    return texture(uGrid, vec3(t, float(layer))).rg;
+}
+
+vec4 sampleBilinear(vec2 uv) { return texture(uStage1, uv); }
+
+vec4 sampleCatmullRom(vec2 uv) {
+    // 9-tap Catmull-Rom using bilinear fetches (Jimenez 2016).
+    vec2 samplePos = uv * uSrcSize;
+    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texPos1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / w12;
+    vec2 texPos0 = (texPos1 - 1.0) / uSrcSize;
+    vec2 texPos3 = (texPos1 + 2.0) / uSrcSize;
+    vec2 texPos12 = (texPos1 + offset12) / uSrcSize;
+    vec4 result = vec4(0.0);
+    result += texture(uStage1, vec2(texPos0.x, texPos0.y)) * w0.x * w0.y;
+    result += texture(uStage1, vec2(texPos12.x, texPos0.y)) * w12.x * w0.y;
+    result += texture(uStage1, vec2(texPos3.x, texPos0.y)) * w3.x * w0.y;
+    result += texture(uStage1, vec2(texPos0.x, texPos12.y)) * w0.x * w12.y;
+    result += texture(uStage1, vec2(texPos12.x, texPos12.y)) * w12.x * w12.y;
+    result += texture(uStage1, vec2(texPos3.x, texPos12.y)) * w3.x * w12.y;
+    result += texture(uStage1, vec2(texPos0.x, texPos3.y)) * w0.x * w3.y;
+    result += texture(uStage1, vec2(texPos12.x, texPos3.y)) * w12.x * w3.y;
+    result += texture(uStage1, vec2(texPos3.x, texPos3.y)) * w3.x * w3.y;
+    return result;
+}
+
+float lanczos3(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 3.0) return 0.0;
+    float px = 3.14159265 * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+vec4 sampleLanczos3(vec2 uv) {
+    vec2 samplePos = uv * uSrcSize - 0.5;
+    vec2 base = floor(samplePos);
+    vec2 f = samplePos - base;
+    float wx[6], wy[6];
+    float sx = 0.0, sy = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        wx[i] = lanczos3(f.x - float(i - 2)); sx += wx[i];
+        wy[i] = lanczos3(f.y - float(i - 2)); sy += wy[i];
+    }
+    ivec2 maxc = ivec2(uSrcSize) - 1;
+    vec4 acc = vec4(0.0);
+    for (int j = 0; j < 6; ++j) {
+        vec4 row = vec4(0.0);
+        int y = clamp(int(base.y) + j - 2, 0, maxc.y);
+        for (int i = 0; i < 6; ++i) {
+            int x = clamp(int(base.x) + i - 2, 0, maxc.x);
+            row += texelFetch(uStage1, ivec2(x, y), 0) * wx[i];
+        }
+        acc += row * wy[j];
+    }
+    return acc / (sx * sy);
+}
+
+vec4 sampleSrc(vec2 uv) {
+    if (uSampler == 0) return sampleBilinear(uv);
+    if (uSampler == 2) return sampleLanczos3(uv);
+    return sampleCatmullRom(uv);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= uOutSize.x || p.y >= uOutSize.y) return;
+
+    vec2 t = uRegionOrigin + (vec2(p) + 0.5) / vec2(uOutSize) * uRegionSize;  // crop-normalised
+    vec2 q = uCrop.xy + t * uCrop.zw;                                           // frame-normalised
+    vec2 q1 = rotateInv(q);
+    vec2 q2 = applyH(uInvPersp, q1);
+
+    vec2 sG = manualDist(q2, 1.0);
+    vec2 sR = sG, sB = sG;
+    if (uChannelsDiffer != 0) {
+        sR = manualDist(q2, uCaScale.x);
+        sB = manualDist(q2, uCaScale.y);
+    }
+    if (uUseGrid != 0) {
+        vec2 gG = gridFetch(sG, 1);
+        vec2 dG = (gG - sG) * uGridStrength;
+        vec2 gR = gG, gB = gG;
+        if (uGridCA != 0) {
+            gR = gridFetch(sR, 0) - gridFetch(sR, 1);
+            gB = gridFetch(sB, 2) - gridFetch(sB, 1);
+        } else {
+            gR = vec2(0.0); gB = vec2(0.0);
+        }
+        sR = sR + dG + gR;
+        sB = sB + dG + gB;
+        sG = sG + dG;
+    }
+
+    // Coverage: anti-aliased edge of the source frame plus the crop rectangle.
+    vec2 dpx = min(sG, 1.0 - sG) * uSrcSize;
+    float cov = clamp(min(dpx.x, dpx.y) + 0.5, 0.0, 1.0);
+    vec2 dcrop = min(t, 1.0 - t) * vec2(uOutSize) / uRegionSize;
+    cov *= clamp(min(dcrop.x, dcrop.y) + 0.5, 0.0, 1.0);
+
+#ifdef DEBUG_COORDS
+    imageStore(uDst, p, vec4(sG, 0.0, cov));
+#else
+    if (cov <= 0.0) { imageStore(uDst, p, vec4(0.0)); return; }
+    vec3 col;
+    if (uChannelsDiffer != 0 || (uUseGrid != 0 && uGridCA != 0)) {
+        col = vec3(sampleSrc(sR).r, sampleSrc(sG).g, sampleSrc(sB).b);
+    } else {
+        col = sampleSrc(sG).rgb;
+    }
+    col = max(col, vec3(0.0));
+    imageStore(uDst, p, vec4(col, cov));
+#endif
+}

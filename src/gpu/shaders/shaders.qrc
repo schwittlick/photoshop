@@ -1,0 +1,11 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/shaders">
+    <file>common.glsl</file>
+    <file>colour.comp</file>
+    <file>warp.comp</file>
+    <file>tone.comp</file>
+    <file>present.vert</file>
+    <file>present.frag</file>
+  </qresource>
+</RCC>
