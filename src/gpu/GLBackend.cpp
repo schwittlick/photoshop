@@ -38,7 +38,7 @@ void GLBackend::abandon() {
 
 void GLBackend::destroyAll() {
     clearSource();
-    for (auto& S : slots_) { pool_->destroy(S.t1); pool_->destroy(S.t2); pool_->destroy(S.t3); }
+    for (auto& S : slots_) { pool_->destroy(S.t1); pool_->destroy(S.t2); pool_->destroy(S.t3); pool_->destroy(S.t4tmp); pool_->destroy(S.t4); }
     GLuint texs[] = {gridTex_, vigTex_, curveTex_, lutTex_};
     for (GLuint t : texs) if (t) gl_->glDeleteTextures(1, &t);
     gridTex_ = vigTex_ = curveTex_ = lutTex_ = 0;
@@ -64,6 +64,8 @@ bool GLBackend::initialize(QString* error) {
         || !warpDebug_.compileCompute(":/shaders/warp.comp", {"DEBUG_COORDS 1"}, &err)
         || !tone8_.compileCompute(":/shaders/tone.comp", {}, &err)
         || !toneF_.compileCompute(":/shaders/tone.comp", {"FLOAT_OUTPUT 1"}, &err)
+        || !sharpen1_.compileCompute(":/shaders/sharpen.comp", {}, &err)
+        || !sharpen2_.compileCompute(":/shaders/sharpen.comp", {"PASS2 1"}, &err)
         || !present_.compileGraphics(":/shaders/present.vert", ":/shaders/present.frag", &err)) {
         if (error) *error = err;
         return false;
@@ -122,7 +124,7 @@ void GLBackend::clearSource() {
     if (srcTex_) gl_->glDeleteTextures(1, &srcTex_);
     srcTex_ = 0;
     srcW_ = srcH_ = levels_ = 0;
-    for (auto& S : slots_) S.has1 = S.has2 = S.has3 = false;
+    for (auto& S : slots_) S.has1 = S.has2 = S.has3 = S.has4 = false;
     ++sourceVersion_;
 }
 
@@ -214,6 +216,11 @@ TextureHandle GLBackend::render(int slot, const ViewSpec& view, const EditParams
     if (!srcTex_ || slot < 0 || slot >= SlotCount || view.outWidth <= 0 || view.outHeight <= 0) return 0;
     RenderOptions opts = optsIn;
     if (opts.debugCoords) { opts.floatOutput = true; opts.histogram = false; }
+    // Preview sharpening: a fourth pass on the encoded image, matching the export's unsharp mask.
+    float sigma = p.outputSharpenRadius * opts.sharpenScale;
+    bool sharpen = opts.sharpenScale > 0.f && p.outputSharpenAmount > 0.f && sigma >= 0.25f && !opts.debugCoords
+                && !optsIn.floatOutput && opts.output != OutputMode::WorkingLinear;
+    if (sharpen) opts.floatOutput = true;  // stage 3 writes floats so the mask sees unquantised values
     SlotCache& S = slots_[slot];
     int level = std::clamp(view.mipLevel, 0, std::max(0, levels_ - 1));
     int lw = std::max(1, srcW_ >> level), lh = std::max(1, srcH_ >> level);
@@ -259,10 +266,19 @@ TextureHandle GLBackend::render(int slot, const ViewSpec& view, const EditParams
     bool re3 = pool_->ensure(S.t3, view.outWidth, view.outHeight, opts.floatOutput ? GL_RGBA32F : GL_RGBA8);
     if (re3 || !S.has3 || !(S.k3 == k3)) {
         runTone(S, p, opts);
-        S.k3 = k3; S.has3 = true;
+        S.k3 = k3; S.has3 = true; ++S.v3;
     }
     if (hist) *hist = S.hist;
-    return S.t3.id;
+    if (!sharpen) return S.t3.id;
+
+    Stage4Key k4{S.v3, sigma, p.outputSharpenAmount / 100.f * 1.5f};
+    bool re4 = pool_->ensure(S.t4tmp, view.outWidth, view.outHeight, GL_RGBA16F);
+    re4 |= pool_->ensure(S.t4, view.outWidth, view.outHeight, GL_RGBA8);
+    if (re4 || !S.has4 || !(S.k4 == k4)) {
+        runSharpen(S, k4.sigma, k4.strength);
+        S.k4 = k4; S.has4 = true;
+    }
+    return S.t4.id;
 }
 
 void GLBackend::runColour(SlotCache& S, int level, const EditParams& p) {
@@ -407,6 +423,30 @@ void GLBackend::releaseSlot(int slot) {
     pool_->destroy(S.t2);
     pool_->destroy(S.t3);
     S.has1 = S.has2 = S.has3 = false;
+}
+
+void GLBackend::runSharpen(SlotCache& S, float sigma, float strength) {
+    gl_->glActiveTexture(GL_TEXTURE0);
+    gl_->glBindTexture(GL_TEXTURE_2D, S.t3.id);
+    gl_->glActiveTexture(GL_TEXTURE1);
+    gl_->glBindTexture(GL_TEXTURE_2D, S.t4tmp.id);
+    sharpen1_.bind();
+    gl_->glBindImageTexture(0, S.t4tmp.id, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    sharpen1_.setInt2("uSize", S.t4.w, S.t4.h);
+    sharpen1_.set("uSigma", sigma);
+    sharpen1_.set("uStrength", strength);
+    dispatch(S.t4.w, S.t4.h);
+    gl_->glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    sharpen1_.release();
+    sharpen2_.bind();
+    gl_->glBindImageTexture(0, S.t4.id, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    sharpen2_.setInt2("uSize", S.t4.w, S.t4.h);
+    sharpen2_.set("uSigma", sigma);
+    sharpen2_.set("uStrength", strength);
+    dispatch(S.t4.w, S.t4.h);
+    gl_->glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
+    sharpen2_.release();
+    checkGL("sharpen stage");
 }
 
 void GLBackend::present(TextureHandle tex, int fbWidth, int fbHeight, const QColor& bg) {

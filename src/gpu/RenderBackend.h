@@ -35,6 +35,7 @@ struct RenderOptions {
     bool histogram = false;
     bool floatOutput = false;   // final texture RGBA32F instead of RGBA8
     bool debugCoords = false;   // warp writes (u, v, 0, coverage) in source coords; tone passes through
+    float sharpenScale = 0.f;   // > 0: preview the output sharpening, radius scaled by this (screen px per image px)
     bool operator==(const RenderOptions&) const = default;
 };
 

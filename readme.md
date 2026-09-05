@@ -14,8 +14,19 @@ Dependencies (Arch package names): `qt6-base`, `libraw`, `lensfun`
 ```sh
 meson setup build            # add --buildtype=release for an optimised build
 meson compile -C build
-./build/rawedit data/DSC08912.ARW
+./build/photoshop data/DSC08912.ARW
 ```
+
+Install system-wide (binary `photoshop` in `/usr/local/bin`, launcher entry, icon
+and raw-file associations so it shows up in menus and "open with"):
+
+```sh
+sudo meson install -C build
+```
+
+For a user-only install without sudo: `meson setup build --prefix ~/.local` (or
+`meson configure build --prefix ~/.local`) before the same install command.
+Uninstall with `sudo ninja -C build uninstall`.
 
 Tests (the GPU test needs a GL 4.3 context; it runs under Qt's offscreen platform):
 
@@ -33,9 +44,9 @@ Headless helpers, useful for scripting and for checking a change without a
 display:
 
 ```sh
-QT_QPA_PLATFORM=offscreen ./build/rawedit file.ARW --screenshot shot.png   # window grab incl. GL canvas
-QT_QPA_PLATFORM=offscreen ./build/rawedit file.ARW --export out.tif        # default export (tif/jpg/png by extension)
-QT_QPA_PLATFORM=offscreen ./build/rawedit file.ARW --demo --screenshot s.png  # applies a set of edits + crop tool
+QT_QPA_PLATFORM=offscreen ./build/photoshop file.ARW --screenshot shot.png   # window grab incl. GL canvas
+QT_QPA_PLATFORM=offscreen ./build/photoshop file.ARW --export out.tif        # default export (tif/jpg/png by extension)
+QT_QPA_PLATFORM=offscreen ./build/photoshop file.ARW --demo --screenshot s.png  # applies a set of edits + crop tool
     --no-lens   disables the lens profile for the headless run
 ```
 
@@ -75,6 +86,7 @@ file -> LibRaw (black level, as-shot WB pre-scale, AHD demosaic, orientation)   
                   contrast, point + parametric curve (1024-entry LUT, display-referred), Oklab
                   saturation/vibrance, output transform (sRGB analytic or ICC 3D LUT), histogram,
                   clipping overlay
+  4  sharpen.comp preview only: separable unsharp mask on the encoded image, radius x zoom
 ```
 
 Everything geometric is expressed in normalised frame coordinates, so the proxy
@@ -149,7 +161,7 @@ Intel UHD iGPU used for development a 45 MP source renders tone changes in
 - The shader resources live in the core static library, so `ShaderProgram` calls
   `Q_INIT_RESOURCE` before the first read; without that reference the linker
   discards the generated resource object and every shader fails to open.
-- Output sharpening and resize apply on export only and are not previewed.
+- Resize applies on export only. Output sharpening is previewed with its radius scaled by the zoom, so it is only judgeable at 100 % or more.
 
 ## Layout
 

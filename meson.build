@@ -130,13 +130,21 @@ moc_files = qt6.compile_moc(
 )
 
 executable(
-  'rawedit',
+  'photoshop',
   ui_sources,
   moc_files,
   include_directories: inc,
   dependencies: [core_dep, qt_widgets_dep],
   install: true,
 )
+
+# Desktop integration: launcher entry, icon, raw MIME associations.
+install_data('packaging/photoshop.desktop', install_dir: get_option('datadir') / 'applications')
+install_data('packaging/photoshop.svg', install_dir: get_option('datadir') / 'icons/hicolor/scalable/apps')
+# Refresh the launcher caches after `meson install` (no-op if the tools are missing).
+meson.add_install_script('sh', '-c',
+  'command -v update-desktop-database >/dev/null && update-desktop-database -q "$MESON_INSTALL_DESTDIR_PREFIX/share/applications" || true; ' +
+  'command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$MESON_INSTALL_DESTDIR_PREFIX/share/icons/hicolor" || true')
 
 # ---------------------------------------------------------------------- tests
 

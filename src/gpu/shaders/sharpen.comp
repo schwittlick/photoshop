@@ -1,0 +1,44 @@
+#version 430
+// Stage 4 (preview only): output sharpening as a separable unsharp mask on the encoded
+// display image, matching Exporter::unsharpMask. Pass 1 blurs horizontally into a
+// premultiplied RGBA16F buffer; pass 2 blurs vertically and applies the mask.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D uSrc;   // stage-3 output (float, encoded)
+layout(binding = 1) uniform sampler2D uTmp;   // pass-1 result
+#ifdef PASS2
+layout(rgba8, binding = 0) uniform writeonly image2D uDst;
+#else
+layout(rgba16f, binding = 0) uniform writeonly image2D uDst;
+#endif
+uniform ivec2 uSize;
+uniform float uSigma;     // in output pixels
+uniform float uStrength;  // amount/100 * 1.5, as on export
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= uSize.x || p.y >= uSize.y) return;
+    int r = clamp(int(ceil(uSigma * 3.0)), 1, 24);
+    float inv2s2 = 0.5 / (uSigma * uSigma);
+    vec4 acc = vec4(0.0);
+    float wsum = 0.0;
+    for (int i = -r; i <= r; ++i) {
+        float w = exp(-float(i * i) * inv2s2);
+#ifdef PASS2
+        vec4 s = texelFetch(uTmp, ivec2(p.x, clamp(p.y + i, 0, uSize.y - 1)), 0);
+#else
+        vec4 s = texelFetch(uSrc, ivec2(clamp(p.x + i, 0, uSize.x - 1), p.y), 0);
+        s.rgb *= s.a;  // premultiply so transparent borders do not darken the blur
+#endif
+        acc += s * w;
+        wsum += w;
+    }
+    acc /= wsum;
+#ifdef PASS2
+    vec4 src = texelFetch(uSrc, p, 0);
+    vec3 blur = acc.a > 1e-4 ? acc.rgb / acc.a : src.rgb;
+    vec3 outc = clamp(src.rgb + uStrength * (src.rgb - blur), 0.0, 1.0);
+    imageStore(uDst, p, vec4(outc, src.a));
+#else
+    imageStore(uDst, p, acc);
+#endif
+}

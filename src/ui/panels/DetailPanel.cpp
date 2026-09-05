@@ -9,7 +9,7 @@ DetailPanel::DetailPanel(EditorSession* session, QWidget* parent) : PanelBase(se
     lay->setContentsMargins(6, 6, 6, 6);
     lay->setSpacing(4);
     auto* sharpen = new CollapsibleGroup(QStringLiteral("Output sharpening"), this);
-    auto* note = new QLabel(QStringLiteral("Unsharp mask applied on export, after any resize. Not shown in the preview."), this);
+    auto* note = new QLabel(QStringLiteral("Unsharp mask applied on export after any resize. Previewed at the current zoom, so judge it at 100 % (key 3)."), this);
     note->setWordWrap(true);
     note->setStyleSheet("color: palette(mid);");
     sharpen->addWidget(note);

@@ -3,6 +3,7 @@
 #include "core/Geometry.h"
 #include "gpu/GLBackend.h"
 #include "io/RawImage.h"
+#include "io/Exporter.h"
 #include <QGuiApplication>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
@@ -212,6 +213,39 @@ int main(int argc, char** argv) {
         double expectEnc = lin_v <= 0.0031308 ? 12.92 * lin_v : 1.055 * std::pow(lin_v, 1 / 2.4) - 0.055;
         std::printf("  sRGB encoded = %.5f %.5f %.5f, expected %.5f\n", ec[0], ec[1], ec[2], expectEnc);
         CHECK(std::abs(ec[0] - expectEnc) < 3e-3 && std::abs(ec[1] - expectEnc) < 3e-3 && std::abs(ec[2] - expectEnc) < 3e-3);
+    }
+
+    // ---- Test 6b: preview sharpening acts on edges only and matches the CPU unsharp mask.
+    std::printf("preview sharpening\n");
+    {
+        be.setSource(img);
+        EditParams sp;
+        ViewSpec sv{512, 384, QRectF(0, 0, 1, 1), QRectF(0, 0, 1, 1), 2};
+        RenderOptions plain, sharp;
+        sharp.sharpenScale = 1.f;
+        sp.outputSharpenAmount = 80;
+        sp.outputSharpenRadius = 1.0f;
+        std::vector<float> a, b;
+        CHECK(be.readback(be.render(RenderBackend::SlotAux, sv, sp, plain), 512, 384, a));
+        CHECK(be.readback(be.render(RenderBackend::SlotAux, sv, sp, sharp), 512, 384, b));
+        CHECK(a != b);
+        // CPU reference: same mask on the plain render
+        std::vector<float> rgb(size_t(512) * 384 * 3);
+        for (size_t i = 0; i < size_t(512) * 384; ++i) for (int c = 0; c < 3; ++c) rgb[i * 3 + c] = a[i * 4 + c];
+        Exporter::unsharpMask(rgb, 512, 384, sp.outputSharpenAmount, sp.outputSharpenRadius);
+        double maxd = 0, sumd = 0;
+        for (size_t i = 0; i < size_t(512) * 384; ++i) for (int c = 0; c < 3; ++c) {
+            double d = std::abs(rgb[i * 3 + c] - b[i * 4 + c]);
+            maxd = std::max(maxd, d); sumd += d;
+        }
+        std::printf("  GPU vs CPU unsharp mask: mean %.5f max %.4f (8-bit step = 0.0039)\n", sumd / (512.0 * 384 * 3), maxd);
+        CHECK(maxd < 0.02 && sumd / (512.0 * 384 * 3) < 0.002);
+        // sub-pixel radius at small zoom: preview leaves the image alone, like the export would at that size
+        RenderOptions tiny;
+        tiny.sharpenScale = 0.1f;
+        std::vector<float> c;
+        CHECK(be.readback(be.render(RenderBackend::SlotAux, sv, sp, tiny), 512, 384, c));
+        CHECK(c == a);
     }
 
     // ---- Test 7: interactive cost on a 45 MP source (viewport-sized passes, so it must not scale with the file).

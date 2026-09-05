@@ -70,8 +70,16 @@ private:
         bool overlay = false, floatOut = false, passthrough = false, histogram = false;
         bool operator==(const Stage3Key&) const = default;
     };
+    struct Stage4Key {
+        unsigned stage3 = 0;
+        float sigma = 0, strength = 0;
+        bool operator==(const Stage4Key&) const = default;
+    };
     struct SlotCache {
-        Texture2D t1, t2, t3;
+        Texture2D t1, t2, t3, t4tmp, t4;
+        Stage4Key k4;
+        bool has4 = false;
+        unsigned v3 = 0;
         Stage1Key k1;
         Stage2Key k2;
         Stage3Key k3;
@@ -88,6 +96,7 @@ private:
     void runColour(SlotCache& S, int level, const EditParams& p);
     void runWarp(SlotCache& S, const ViewSpec& view, const EditParams& p, const RenderOptions& o);
     void runTone(SlotCache& S, const EditParams& p, const RenderOptions& o);
+    void runSharpen(SlotCache& S, float sigma, float strength);
     void ensureCurveLut(const ToneParams& t);
     void dispatch(int w, int h);
     void checkGL(const char* where);
@@ -96,7 +105,7 @@ private:
     QOpenGLFunctions_4_3_Core* gl_ = nullptr;
     QOpenGLContext* ctx_ = nullptr;
     std::unique_ptr<TexturePool> pool_;
-    ShaderProgram colour_, warp_, warpDebug_, tone8_, toneF_, present_;
+    ShaderProgram colour_, warp_, warpDebug_, tone8_, toneF_, sharpen1_, sharpen2_, present_;
     QString info_;
     GLuint vao_ = 0, histSSBO_ = 0;
 

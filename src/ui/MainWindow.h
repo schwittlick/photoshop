@@ -26,7 +26,7 @@ public:
     void openFile(const QString& path);
     // Headless helpers (offscreen testing): after the next successful load, grab the window
     // to `screenshotPath` and/or export with default settings to `exportPath`, then quit.
-    void runHeadless(const QString& screenshotPath, const QString& exportPath, bool disableLens, bool demo, const QString& toolName);
+    void runHeadless(const QString& screenshotPath, const QString& exportPath, bool disableLens, bool demo, const QString& toolName, double zoom);
 
 protected:
     bool eventFilter(QObject* obj, QEvent* ev) override;

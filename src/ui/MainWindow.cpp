@@ -280,7 +280,7 @@ void MainWindow::setToolAction(Tool t) {
 
 void MainWindow::updateTitle() {
     QString name = session_->hasImage() ? QFileInfo(session_->filePath()).fileName() : QString();
-    setWindowTitle(name.isEmpty() ? QStringLiteral("rawedit") : QStringLiteral("%1 — rawedit").arg(name));
+    setWindowTitle(name.isEmpty() ? QStringLiteral("photoshop") : QStringLiteral("%1 — photoshop").arg(name));
 }
 
 void MainWindow::updateHistoryActions() {
@@ -428,8 +428,8 @@ bool MainWindow::runExport(const ExportSettings& s, bool interactive, QString* e
     return true;
 }
 
-void MainWindow::runHeadless(const QString& screenshotPath, const QString& exportPath, bool disableLens, bool demo, const QString& toolName) {
-    connect(session_, &EditorSession::loadFinished, this, [this, screenshotPath, exportPath, disableLens, demo, toolName](bool ok, const QString& err) {
+void MainWindow::runHeadless(const QString& screenshotPath, const QString& exportPath, bool disableLens, bool demo, const QString& toolName, double zoom) {
+    connect(session_, &EditorSession::loadFinished, this, [this, screenshotPath, exportPath, disableLens, demo, toolName, zoom](bool ok, const QString& err) {
         if (!ok) { fprintf(stderr, "load failed: %s\n", err.toUtf8().constData()); QCoreApplication::exit(2); return; }
         fprintf(stdout, "loaded: %s\nlens: %s\n", session_->imageDescription().toUtf8().constData(), session_->lensStatus().toUtf8().constData());
         if (disableLens) { EditParams p = session_->params(); p.lens.lensAuto = false; session_->setParams(p, false); }
@@ -442,6 +442,7 @@ void MainWindow::runHeadless(const QString& screenshotPath, const QString& expor
             p.geom.perspVertical = 15;
             p.geom.cropNorm = QRectF(0.12, 0.08, 0.72, 0.8);
             session_->setParams(p, false);
+            p.outputSharpenAmount = 60;
             p.geom.corners[0] = QVector2D(0.06f, 0.04f);
             p.geom.corners[1] = QVector2D(-0.04f, 0.05f);
             session_->setParams(p, false);
@@ -452,6 +453,7 @@ void MainWindow::runHeadless(const QString& screenshotPath, const QString& expor
         else if (toolName == "crop") canvas_->setTool(Tool::Crop);
         else if (toolName == "straighten") canvas_->setTool(Tool::Straighten);
         else if (toolName == "hand") canvas_->setTool(Tool::Hand);
+        if (zoom > 0) canvas_->setZoom(zoom);
         QTimer::singleShot(800, this, [this, screenshotPath, exportPath] {
             int rc = 0;
             if (!screenshotPath.isEmpty()) {

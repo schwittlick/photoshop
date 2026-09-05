@@ -96,6 +96,7 @@ void CanvasWidget::paintGL() {
         RenderOptions opts;
         opts.output = useLut_ ? OutputMode::DisplayLUT : OutputMode::DisplaySRGB;
         opts.clipOverlay = showClipping_ && !beforeAfter_;
+        opts.sharpenScale = beforeAfter_ ? 0.f : float(effectiveZoom());
         TextureHandle tex = backend_->render(RenderBackend::SlotCanvas, buildView(), p, opts);
         backend_->present(tex, fbW, fbH, kBackground);
         double z = effectiveZoom();

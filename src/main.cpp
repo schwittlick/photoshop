@@ -1,5 +1,6 @@
 #include "ui/MainWindow.h"
 #include <QApplication>
+#include <QIcon>
 #include <QPalette>
 #include <QStyleFactory>
 #include <QSurfaceFormat>
@@ -14,8 +15,10 @@ int main(int argc, char** argv) {
     QSurfaceFormat::setDefaultFormat(fmt);
 
     QApplication app(argc, argv);
-    app.setApplicationName(QStringLiteral("rawedit"));
-    app.setOrganizationName(QStringLiteral("rawedit"));
+    app.setApplicationName(QStringLiteral("photoshop"));
+    app.setDesktopFileName(QStringLiteral("photoshop"));
+    app.setWindowIcon(QIcon::fromTheme(QStringLiteral("photoshop")));
+    app.setOrganizationName(QStringLiteral("photoshop"));
     app.setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
     QPalette pal;
     pal.setColor(QPalette::Window, QColor(50, 50, 50));
@@ -39,6 +42,7 @@ int main(int argc, char** argv) {
     QString file, screenshot, exportPath;
     bool noLens = false, demo = false;
     QString toolName;
+    double zoom = 0;
     const QStringList args = app.arguments();
     for (int i = 1; i < args.size(); ++i) {
         if (args[i] == "--screenshot" && i + 1 < args.size()) screenshot = args[++i];
@@ -46,12 +50,13 @@ int main(int argc, char** argv) {
         else if (args[i] == "--no-lens") noLens = true;
         else if (args[i] == "--demo") demo = true;
         else if (args[i] == "--tool" && i + 1 < args.size()) toolName = args[++i];
+        else if (args[i] == "--zoom" && i + 1 < args.size()) zoom = args[++i].toDouble();
         else if (!args[i].startsWith("--")) file = args[i];
     }
     re::MainWindow w;
     w.resize(1500, 950);
     w.show();
-    if (!screenshot.isEmpty() || !exportPath.isEmpty() || demo) w.runHeadless(screenshot, exportPath, noLens, demo, toolName);
+    if (!screenshot.isEmpty() || !exportPath.isEmpty() || demo) w.runHeadless(screenshot, exportPath, noLens, demo, toolName, zoom);
     if (!file.isEmpty()) w.openFile(file);
     return app.exec();
 }

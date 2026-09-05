@@ -5,6 +5,7 @@
     <file>colour.comp</file>
     <file>warp.comp</file>
     <file>tone.comp</file>
+    <file>sharpen.comp</file>
     <file>present.vert</file>
     <file>present.frag</file>
   </qresource>
