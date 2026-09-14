@@ -2,8 +2,8 @@
 Type=Application
 Name=photoshop
 GenericName=Raw Image Editor
-Comment=Develop a single raw file: lens correction, perspective, crop, white balance, tone, export
-Exec=photoshop %f
+Comment=Develop raw files: lens correction, perspective, crop, white balance, tone, sync settings across a set, export
+Exec=photoshop %F
 Icon=photoshop
 Terminal=false
 Categories=Graphics;Photography;RasterGraphics;Qt;

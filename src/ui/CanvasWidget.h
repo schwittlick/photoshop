@@ -1,14 +1,17 @@
 #pragma once
 // The image canvas: owns the GL backend, renders the visible viewport region from the
 // right proxy level, and hosts the interactive tools (hand, crop, straighten, WB
-// eyedropper, perspective handles). Overlays are drawn with QPainter on top.
+// eyedropper, perspective handles, upright guides). Overlays are drawn with QPainter on top.
 #include "gpu/RenderBackend.h"
 #include "io/Exporter.h"
 #include "ui/EditorSession.h"
 #include "ui/Tools.h"
+#include <QLineF>
+#include <QList>
 #include <QOpenGLWidget>
 #include <QPointF>
 #include <memory>
+#include <vector>
 
 namespace re {
 
@@ -26,8 +29,10 @@ public:
     double effectiveZoom() const;
     bool showClipping() const { return showClipping_; }
 
-    // Full-resolution render for export; makes the context current itself.
-    bool renderForExport(const EditParams& params, Sampler sampler, ExportJob& job, const Exporter::Progress& progress, QString* error);
+    // Full-resolution render of any loaded image for export, not only the active one; makes the context
+    // current itself. If another image's data replaced the active one's on the GPU, the next paint re-uploads it.
+    bool renderForExport(const RawImage& img, const LensGrid& grid, const VignetteLut& vig, const EditParams& params, Sampler sampler,
+                         ExportJob& job, const Exporter::Progress& progress, QString* error);
 
 public slots:
     void setTool(Tool t);
@@ -39,6 +44,9 @@ public slots:
     void setShowClipping(bool on);
     void setBeforeAfter(bool on);
     void autoCropToFit(bool keepAspect);
+    void autoTone();  // solves the tone sliders from the histogram of the crop (core/AutoTone.h)
+    // Adds upright guides given in frame coordinates of the current view (headless helper) and applies them.
+    void addGuidesFromFrame(const QList<QLineF>& lines);
     void setDisplayLut(const std::vector<float>& lut, int n);  // empty -> plain sRGB
 
 signals:
@@ -60,7 +68,7 @@ protected:
     void keyPressEvent(QKeyEvent*) override;
 
 private:
-    enum class Drag { None, Pan, CropMove, CropHandle, CropNew, Straighten, Perspective };
+    enum class Drag { None, Pan, CropMove, CropHandle, CropNew, Straighten, Perspective, GuideNew, GuideEnd };
 
     // geometry helpers
     QRectF viewCrop() const;                 // crop rect the canvas is showing (full frame in geometry tools)
@@ -78,6 +86,13 @@ private:
     void uploadLensData();
     void pickWhiteBalance(QPointF screenPos);
     void applyStraighten();
+    // Renders `p` small and finds the largest rectangle without empty corners; makes the context current itself.
+    bool computeAutoCrop(const EditParams& p, bool keepAspect, QRectF* crop, QString* message);
+    Vec2 screenToLens(QPointF s) const;          // through the current rotation and perspective
+    QPointF lensToScreen(QPointF lensPt) const;
+    int guideEndAt(QPointF s, const std::vector<Guide>& guides) const;  // guide*2 + end, -1 none
+    int guideAt(QPointF s, const std::vector<Guide>& guides) const;
+    void applyGuides(std::vector<Guide> guides);  // stores them, solves the perspective, auto-crops, one undo step
     int cropHandleAt(QPointF s) const;       // 0..7 handles, 8 inside, -1 none
     QRectF constrainCrop(QRectF r, int handle) const;
     void updateCursor(QPointF s);
@@ -103,6 +118,8 @@ private:
     QRectF cropStart_;
     int cropHandle_ = -1;
     int perspHandle_ = -1;
+    int guideEnd_ = -1;
+    std::vector<Guide> guideDraft_;  // the guides while an end point is being dragged
     QPointF lineStart_, lineEnd_;
     bool spaceHeld_ = false;
     double lastReportedZoom_ = -1;

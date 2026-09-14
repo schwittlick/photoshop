@@ -1,4 +1,5 @@
 #include "core/LensModel.h"
+#include <memory>
 #include <lensfun/lensfun.h>
 #include <QDebug>
 #include <algorithm>
@@ -35,8 +36,22 @@ Vec2 LensGrid::sample(int ch, Vec2 q) const {
     return a * (1 - ty) + b * ty;
 }
 
+namespace {
+// One database for every LensModel: loading it costs time and memory, and it is read-only after Load().
+std::shared_ptr<lfDatabase> sharedDatabase(bool* loaded) {
+    static std::shared_ptr<lfDatabase> db;
+    static bool ok = false;
+    if (!db) {
+        db = std::make_shared<lfDatabase>();
+        ok = db->Load() == LF_NO_ERROR;
+    }
+    *loaded = ok;
+    return db;
+}
+}  // namespace
+
 struct LensModel::Impl {
-    lfDatabase* db = nullptr;
+    std::shared_ptr<lfDatabase> db;
     bool loaded = false;
     const lfCamera* cam = nullptr;
     const lfLens* lens = nullptr;
@@ -45,15 +60,11 @@ struct LensModel::Impl {
 };
 
 LensModel::LensModel() : d_(new Impl) {
-    d_->db = new lfDatabase();
-    lfError e = d_->db->Load();
-    d_->loaded = (e == LF_NO_ERROR);
+    d_->db = sharedDatabase(&d_->loaded);
     if (!d_->loaded) d_->status = QStringLiteral("lensfun database not found");
 }
 
-LensModel::~LensModel() {
-    delete d_->db;
-}
+LensModel::~LensModel() = default;
 
 bool LensModel::databaseLoaded() const { return d_->loaded; }
 

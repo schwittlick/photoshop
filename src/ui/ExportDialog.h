@@ -15,7 +15,9 @@ class SliderRow;
 class ExportDialog : public QDialog {
     Q_OBJECT
 public:
-    ExportDialog(EditorSession* session, QWidget* parent = nullptr);
+    // batchCount > 0: settings for exporting that many images into one folder. settings().outputPath is
+    // then the folder and every file is named after its raw; the per-image sharpening sliders are hidden.
+    ExportDialog(EditorSession* session, int batchCount, QWidget* parent = nullptr, const QString& noun = QStringLiteral("images"));
     const ExportSettings& settings() const { return settings_; }
 
 protected:
@@ -26,6 +28,8 @@ private:
     void updateSizeInfo();
 
     EditorSession* session_;
+    int batchCount_;
+    QString noun_;
     ExportSettings settings_;
     QComboBox* format_;
     QComboBox* compression_;
@@ -35,8 +39,8 @@ private:
     QSpinBox* longEdge_;
     QComboBox* sampler_;
     QCheckBox* exif_;
-    SliderRow* sharpAmount_;
-    SliderRow* sharpRadius_;
+    SliderRow* sharpAmount_ = nullptr;
+    SliderRow* sharpRadius_ = nullptr;
     QLabel* sizeInfo_;
 };
 

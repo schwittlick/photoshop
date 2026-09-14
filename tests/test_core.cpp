@@ -5,6 +5,10 @@
 #include "core/History.h"
 #include "core/LensModel.h"
 #include "core/OutputProfiles.h"
+#include "io/Sidecar.h"
+#include <QFile>
+#include <QJsonArray>
+#include <QTemporaryDir>
 #include <cmath>
 #include <cstdio>
 
@@ -232,11 +236,169 @@ static void testIcc() {
     }
 }
 
+static void testSync() {
+    std::printf("sync\n");
+    EditParams src;
+    src.wb.temp = 3200; src.wb.tint = 12;
+    src.tone.exposureEV = 1.5f; src.tone.contrast = 30; src.tone.vibrance = 20;
+    src.tone.pLights = 15;
+    src.tone.curveMaster.pts = {QPointF(0, 0), QPointF(0.4, 0.3), QPointF(1, 1)};
+    src.lens.lensAuto = false; src.lens.distC = 5;
+    src.geom.rotationDeg = 2.5f; src.geom.perspVertical = 20; src.geom.corners[1] = QVector2D(0.05f, -0.02f);
+    src.geom.cropNorm = QRectF(0.1, 0.1, 0.5, 0.6);
+    src.outputSharpenAmount = 70;
+    EditParams dst;
+    dst.wb.temp = 5600; dst.geom.cropNorm = QRectF(0.2, 0.0, 0.7, 0.7); dst.geom.rotationDeg = -1;
+
+    // Defaults: tone, curves, lens and output sharpening travel; the frame-specific groups stay.
+    EditParams out = applySync(src, dst, SyncMask());
+    CHECK(out.tone.exposureEV == 1.5f && out.tone.contrast == 30 && out.tone.vibrance == 20);
+    CHECK(out.tone.pLights == 15 && out.tone.curveMaster == src.tone.curveMaster);
+    CHECK(out.lens == src.lens);
+    CHECK(out.outputSharpenAmount == 70);
+    CHECK(out.wb == dst.wb);
+    CHECK(out.geom.cropNorm == dst.geom.cropNorm);
+    CHECK(out.geom.rotationDeg == -1 && out.geom.perspVertical == 0 && out.geom.corners[1] == QVector2D());
+    SyncMask all;
+    all.whiteBalance = all.rotation = all.perspective = all.crop = true;
+    CHECK(applySync(src, dst, all) == src);
+    SyncMask none;
+    none.tone = none.curves = none.lens = none.outputSharpen = false;
+    CHECK(!none.any());
+    CHECK(applySync(src, dst, none) == dst);
+    // Tone and curves are separate groups: syncing only the curves leaves the exposure alone.
+    SyncMask curvesOnly = none;
+    curvesOnly.curves = true;
+    out = applySync(src, dst, curvesOnly);
+    CHECK(out.tone.exposureEV == 0.f && out.tone.curveMaster == src.tone.curveMaster && out.tone.pLights == 15);
+}
+
+static void testGuidedUpright() {
+    std::printf("guided upright\n");
+    const int W = 1500, H = 1000;
+    const double aspect = double(W) / H;
+    // A rectangle in the scene (metric coordinates) photographed through a keystone plus a tilt: the guides
+    // are what the camera saw, in frame coordinates.
+    Mat3 G;  // scene -> photo (metric)
+    {
+        Mat3 P; P.m[2][0] = 0.18; P.m[2][1] = -0.22;
+        Mat3 R; double th = 4.0 * kPi / 180; R.m[0][0] = std::cos(th); R.m[0][1] = -std::sin(th); R.m[1][0] = std::sin(th); R.m[1][1] = std::cos(th);
+        G = R * P;
+    }
+    auto photo = [&](double mx, double my) { Vec2 q = G.apply(Vec2(mx, my)); return QPointF(q.x / aspect + 0.5, q.y + 0.5); };
+    Guide v1{photo(-0.3, -0.25), photo(-0.3, 0.25), true}, v2{photo(0.3, -0.2), photo(0.3, 0.3), true};
+    Guide h1{photo(-0.35, -0.2), photo(0.35, -0.2), false}, h2{photo(-0.3, 0.2), photo(0.4, 0.2), false};
+    auto check = [&](const std::vector<Guide>& guides, double rotationDeg, bool expectOk, const char* what) {
+        std::array<QVector2D, 4> corners;
+        QString why;
+        bool ok = geom::solveGuidedUpright(guides, aspect, rotationDeg, &corners, &why);
+        if (ok != expectOk) std::printf("  %s: unexpected %s (%s)\n", what, ok ? "success" : "failure", why.toUtf8().constData());
+        CHECK(ok == expectOk);
+        if (!ok) return;
+        GeometryParams g;
+        g.rotationDeg = float(rotationDeg);
+        g.corners = corners;
+        geom::FrameGeometry fg = geom::FrameGeometry::compute(g, W, H);
+        double worst = 0;
+        for (const Guide& gd : guides) {
+            Vec2 a = fg.lensToFrame(Vec2(gd.a.x(), gd.a.y())), b = fg.lensToFrame(Vec2(gd.b.x(), gd.b.y()));
+            double err = gd.vertical ? std::abs(a.x - b.x) * W : std::abs(a.y - b.y) * H;  // pixels at full resolution
+            worst = std::max(worst, err);
+        }
+        Vec2 c = fg.lensToFrame(Vec2(0.5, 0.5));
+        std::printf("  %s: worst deviation %.5f px, centre moved %.5f px\n", what, worst, std::hypot((c.x - 0.5) * W, (c.y - 0.5) * H));
+        CHECK(worst < 1e-3);
+        CHECK(std::hypot((c.x - 0.5) * W, (c.y - 0.5) * H) < 1e-3);
+    };
+    check({v1, v2}, 0, true, "two verticals");
+    check({h1, h2}, 0, true, "two horizontals");
+    check({v1, h1}, 0, true, "one of each");
+    check({v1, v2, h1, h2}, 0, true, "two of each");
+    check({v1, v2, h1}, 0, true, "two verticals and a horizontal");
+    check({v1, v2, h1, h2}, 5.0, true, "two of each with an existing rotation");
+    check({v1}, 0, false, "one guide");
+    // Guides crossing inside the frame (an X) cannot be made parallel.
+    Guide x1{QPointF(0.2, 0.1), QPointF(0.8, 0.9), true}, x2{QPointF(0.8, 0.1), QPointF(0.2, 0.9), true};
+    check({x1, x2}, 0, false, "guides crossing inside the frame");
+    // Already-straight guides are a no-op: the corners stay at zero.
+    Guide s1{QPointF(0.2, 0.1), QPointF(0.2, 0.9), true}, s2{QPointF(0.8, 0.1), QPointF(0.8, 0.9), true};
+    std::array<QVector2D, 4> corners;
+    CHECK(geom::solveGuidedUpright({s1, s2}, aspect, 0, &corners, nullptr));
+    for (const QVector2D& c : corners) CHECK(std::abs(c.x()) < 1e-9 && std::abs(c.y()) < 1e-9);
+}
+
+static void testSidecar() {
+    std::printf("sidecar\n");
+    EditParams p;  // every field away from its default
+    p.wb.temp = 3210; p.wb.tint = -7.5f;
+    p.tone.exposureEV = -0.35f; p.tone.contrast = 12; p.tone.highlights = -40; p.tone.shadows = 33; p.tone.whites = 5; p.tone.blacks = -9;
+    p.tone.saturation = 4; p.tone.vibrance = 18; p.tone.pHighlights = 1; p.tone.pLights = 2; p.tone.pDarks = 3; p.tone.pShadows = 4;
+    p.tone.curveMaster.pts = {QPointF(0, 0), QPointF(0.25, 0.2), QPointF(0.75, 0.8), QPointF(1, 1)};
+    p.tone.curveR.pts = {QPointF(0, 0.02), QPointF(1, 0.98)};
+    p.tone.curveG.pts = {QPointF(0, 0), QPointF(0.5, 0.55), QPointF(1, 1)};
+    p.tone.curveB.pts = {QPointF(0, 0), QPointF(1, 0.9)};
+    p.lens.lensAuto = false; p.lens.profileDistortion = 80; p.lens.profileVignetting = 120; p.lens.profileCA = false;
+    p.lens.distA = 0.5f; p.lens.distB = -1.5f; p.lens.distC = 2.5f; p.lens.caRed = -3; p.lens.caBlue = 4; p.lens.vignetteAmount = -25; p.lens.vignetteMidpoint = 60;
+    p.geom.rotationDeg = -1.75f; p.geom.perspVertical = 22; p.geom.perspHorizontal = -8;
+    p.geom.corners = {QVector2D(0.01f, 0.02f), QVector2D(-0.03f, 0.04f), QVector2D(0.05f, -0.06f), QVector2D(-0.07f, -0.08f)};
+    p.geom.cropNorm = QRectF(0.1, 0.2, 0.6, 0.5);
+    p.geom.guides = {Guide{QPointF(0.2, 0.1), QPointF(0.25, 0.9), true}, Guide{QPointF(0.1, 0.3), QPointF(0.9, 0.35), false}};
+    p.outputSharpenAmount = 45; p.outputSharpenRadius = 1.3f;
+
+    // JSON round trip is exact.
+    EditParams back;
+    QString err;
+    CHECK(sidecar::fromJson(sidecar::toJson(p), &back, &err));
+    CHECK(back == p);
+    // Missing keys keep what the caller passed in (the image's defaults); unknown keys are ignored.
+    EditParams defaults;
+    defaults.wb.temp = 4711;
+    QJsonObject partial{{"format", "photoshop-edit"}, {"version", 1}, {"tone", QJsonObject{{"exposure", 1.0}, {"future", 3}}}, {"other", true}};
+    EditParams got = defaults;
+    CHECK(sidecar::fromJson(partial, &got, &err));
+    CHECK(got.wb.temp == 4711 && got.tone.exposureEV == 1.0f && got.geom.cropNorm == QRectF(0, 0, 1, 1));
+    // Wrong format, a newer version and a broken curve are rejected without touching the output.
+    EditParams untouched = defaults;
+    CHECK(!sidecar::fromJson(QJsonObject{{"format", "something-else"}, {"version", 1}}, &untouched, &err) && untouched == defaults);
+    QJsonObject newer = sidecar::toJson(p);
+    newer["version"] = sidecar::kVersion + 1;
+    CHECK(!sidecar::fromJson(newer, &untouched, &err) && untouched == defaults);
+    QJsonObject badCurve = sidecar::toJson(p);
+    {
+        QJsonObject tone = badCurve["tone"].toObject(), curves = tone["curves"].toObject();
+        curves["master"] = QJsonArray{QJsonArray{0, 0}, QJsonArray{2, 1}};
+        tone["curves"] = curves;
+        badCurve["tone"] = tone;
+    }
+    CHECK(!sidecar::fromJson(badCurve, &untouched, &err) && untouched == defaults);
+    // File round trip next to a (pretend) raw: absent, written, read back exactly, unreadable, removed.
+    QTemporaryDir tmp;
+    CHECK(tmp.isValid());
+    const QString raw = tmp.filePath("DSC00001.ARW");
+    CHECK(sidecar::pathFor(raw) == raw + ".json");
+    EditParams loaded = defaults;
+    CHECK(sidecar::read(raw, &loaded, &err) == sidecar::ReadResult::None);
+    CHECK(sidecar::write(raw, p, &err));
+    CHECK(sidecar::read(raw, &loaded, &err) == sidecar::ReadResult::Loaded && loaded == p);
+    {
+        QFile f(sidecar::pathFor(raw));
+        CHECK(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        f.write("{ not json");
+    }
+    loaded = defaults;
+    CHECK(sidecar::read(raw, &loaded, &err) == sidecar::ReadResult::Invalid && loaded == defaults);
+    CHECK(sidecar::remove(raw, &err) && !QFile::exists(sidecar::pathFor(raw)));
+    CHECK(sidecar::remove(raw, &err));
+}
+
 int main() {
     testIcc();
     testColour();
     testCurve();
     testHistory();
+    testSync();
+    testSidecar();
+    testGuidedUpright();
     testGeometry();
     testLens();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }

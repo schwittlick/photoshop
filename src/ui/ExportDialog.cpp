@@ -3,22 +3,22 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
-#include <QPushButton>
 #include <QLabel>
+#include <QPushButton>
 #include <QSettings>
-#include <QStandardItemModel>
-#include <QDir>
 #include <QSpinBox>
 #include <QVBoxLayout>
 #include <cmath>
 
 namespace re {
 
-ExportDialog::ExportDialog(EditorSession* session, QWidget* parent) : QDialog(parent), session_(session) {
-    setWindowTitle(QStringLiteral("Export"));
+ExportDialog::ExportDialog(EditorSession* session, int batchCount, QWidget* parent, const QString& noun)
+    : QDialog(parent), session_(session), batchCount_(batchCount), noun_(noun) {
+    setWindowTitle(batchCount_ > 0 ? QStringLiteral("Export %1 %2").arg(batchCount_).arg(noun_) : QStringLiteral("Export"));
     QSettings st;
     auto* lay = new QVBoxLayout(this);
     auto* form = new QFormLayout();
@@ -64,23 +64,31 @@ ExportDialog::ExportDialog(EditorSession* session, QWidget* parent) : QDialog(pa
     form->addRow(QString(), exif_);
     lay->addLayout(form);
 
-    sharpAmount_ = new SliderRow(QStringLiteral("Sharpen"), 0, 100, 1, 0, this);
-    sharpRadius_ = new SliderRow(QStringLiteral("Radius"), 0.3, 3.0, 0.1, 1, this);
-    sharpRadius_->setSuffix(QStringLiteral(" px"));
-    sharpAmount_->setValueSilently(session_->params().outputSharpenAmount);
-    sharpRadius_->setValueSilently(session_->params().outputSharpenRadius);
-    sharpAmount_->setDefault(0);
-    sharpRadius_->setDefault(0.8);
-    auto* sharpNote = new QLabel(QStringLiteral("Output sharpening (unsharp mask after resize):"), this);
-    lay->addWidget(sharpNote);
-    lay->addWidget(sharpAmount_);
-    lay->addWidget(sharpRadius_);
-    connect(sharpAmount_, &SliderRow::valueChanged, this, [this](double v, bool interactive) {
-        EditParams p = session_->params(); p.outputSharpenAmount = float(v); session_->setParams(p, interactive);
-    });
-    connect(sharpRadius_, &SliderRow::valueChanged, this, [this](double v, bool interactive) {
-        EditParams p = session_->params(); p.outputSharpenRadius = float(v); session_->setParams(p, interactive);
-    });
+    if (batchCount_ > 0) {
+        auto* note = new QLabel(QStringLiteral("Every image is written to one folder, named after its raw file, with its own crop and output "
+                                               "sharpening (Detail panel; use Sync settings to give them all the same)."), this);
+        note->setWordWrap(true);
+        note->setStyleSheet("color: palette(mid);");
+        lay->addWidget(note);
+    } else {
+        sharpAmount_ = new SliderRow(QStringLiteral("Sharpen"), 0, 100, 1, 0, this);
+        sharpRadius_ = new SliderRow(QStringLiteral("Radius"), 0.3, 3.0, 0.1, 1, this);
+        sharpRadius_->setSuffix(QStringLiteral(" px"));
+        sharpAmount_->setValueSilently(session_->params().outputSharpenAmount);
+        sharpRadius_->setValueSilently(session_->params().outputSharpenRadius);
+        sharpAmount_->setDefault(0);
+        sharpRadius_->setDefault(0.8);
+        auto* sharpNote = new QLabel(QStringLiteral("Output sharpening (unsharp mask after resize):"), this);
+        lay->addWidget(sharpNote);
+        lay->addWidget(sharpAmount_);
+        lay->addWidget(sharpRadius_);
+        connect(sharpAmount_, &SliderRow::valueChanged, this, [this](double v, bool interactive) {
+            EditParams p = session_->params(); p.outputSharpenAmount = float(v); session_->setParams(p, interactive);
+        });
+        connect(sharpRadius_, &SliderRow::valueChanged, this, [this](double v, bool interactive) {
+            EditParams p = session_->params(); p.outputSharpenRadius = float(v); session_->setParams(p, interactive);
+        });
+    }
 
     sizeInfo_ = new QLabel(this);
     sizeInfo_->setStyleSheet("color: palette(mid);");
@@ -107,8 +115,6 @@ void ExportDialog::updateEnabled() {
     longEdge_->setEnabled(resize_->isChecked());
     // Rec.2020 linear only makes sense at 16 bit
     bool eight = Exporter::isEightBit(f);
-    auto* model = qobject_cast<QStandardItemModel*>(space_->model());
-    Q_UNUSED(model);
     if (eight && space_->currentIndex() == int(icc::Space::Rec2020Linear)) space_->setCurrentIndex(0);
 }
 
@@ -122,7 +128,8 @@ void ExportDialog::updateSizeInfo() {
         w = std::max(1, int(std::lround(w * s)));
         h = std::max(1, int(std::lround(h * s)));
     }
-    sizeInfo_->setText(QStringLiteral("Output size: %1 × %2 px").arg(w).arg(h));
+    sizeInfo_->setText(batchCount_ > 0 ? QStringLiteral("Active image: %1 × %2 px; the others follow their own crop").arg(w).arg(h)
+                                       : QStringLiteral("Output size: %1 × %2 px").arg(w).arg(h));
 }
 
 void ExportDialog::accept() {
@@ -149,13 +156,20 @@ void ExportDialog::accept() {
     QString ext = Exporter::defaultExtension(settings_.format);
     QFileInfo src(session_->filePath());
     QString dir = st.value("export/dir", src.absolutePath()).toString();
-    QString suggested = QDir(dir).filePath(src.completeBaseName() + "." + ext);
-    QString filter = QStringLiteral("%1 (*.%2)").arg(Exporter::formatName(settings_.format), ext);
-    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export image"), suggested, filter);
-    if (path.isEmpty()) return;
-    if (QFileInfo(path).suffix().isEmpty()) path += "." + ext;
-    settings_.outputPath = path;
-    st.setValue("export/dir", QFileInfo(path).absolutePath());
+    if (batchCount_ > 0) {
+        QString folder = QFileDialog::getExistingDirectory(this, QStringLiteral("Export %1 %2 into folder").arg(batchCount_).arg(noun_), dir);
+        if (folder.isEmpty()) return;
+        settings_.outputPath = folder;
+        st.setValue("export/dir", folder);
+    } else {
+        QString suggested = QDir(dir).filePath(src.completeBaseName() + "." + ext);
+        QString filter = QStringLiteral("%1 (*.%2)").arg(Exporter::formatName(settings_.format), ext);
+        QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export image"), suggested, filter);
+        if (path.isEmpty()) return;
+        if (QFileInfo(path).suffix().isEmpty()) path += "." + ext;
+        settings_.outputPath = path;
+        st.setValue("export/dir", QFileInfo(path).absolutePath());
+    }
     QDialog::accept();
 }
 

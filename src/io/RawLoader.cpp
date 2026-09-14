@@ -1,6 +1,9 @@
 #include "io/RawLoader.h"
 #include <libraw/libraw.h>
+#include <QBuffer>
 #include <QFileInfo>
+#include <QImageReader>
+#include <QTransform>
 #include <algorithm>
 #include <cstring>
 
@@ -99,6 +102,56 @@ std::shared_ptr<RawImage> RawLoader::load(const QString& path, QString* error) {
     img->iso = int(proc.imgdata.other.iso_speed);
     img->focal35 = proc.imgdata.lens.FocalLengthIn35mmFormat;
     return img;
+}
+
+QImage RawLoader::loadThumbnail(const QString& path, int maxEdge, QString* error) {
+    auto fail = [&](const QString& msg) { if (error) *error = msg; return QImage(); };
+    LibRaw proc;
+    int rc = proc.open_file(path.toLocal8Bit().constData());
+    if (rc != LIBRAW_SUCCESS) return fail(QStringLiteral("LibRaw: %1").arg(libraw_strerror(rc)));
+    rc = proc.unpack_thumb();
+    if (rc != LIBRAW_SUCCESS) return fail(QStringLiteral("LibRaw thumbnail: %1").arg(libraw_strerror(rc)));
+    const auto& T = proc.imgdata.thumbnail;
+    QImage img;
+    bool oriented = false;  // the decoder already applied an orientation stored with the preview itself
+    if (T.tformat == LIBRAW_THUMBNAIL_JPEG && T.thumb && T.tlength > 0) {
+        QByteArray bytes = QByteArray::fromRawData(T.thumb, int(T.tlength));
+        QBuffer buf(&bytes);
+        buf.open(QIODevice::ReadOnly);
+        QImageReader reader(&buf, "jpeg");
+        reader.setAutoTransform(true);
+        QSize sz = reader.size();
+        // Let libjpeg decode at reduced size: much faster than decoding a 2 MP preview and scaling it down.
+        if (sz.isValid() && std::max(sz.width(), sz.height()) > 2 * maxEdge) reader.setScaledSize(sz.scaled(2 * maxEdge, 2 * maxEdge, Qt::KeepAspectRatio));
+        oriented = reader.transformation() != QImageIOHandler::TransformationNone;
+        img = reader.read();
+    } else if ((T.tformat == LIBRAW_THUMBNAIL_BITMAP || T.tformat == LIBRAW_THUMBNAIL_BITMAP16) && T.thumb && T.twidth > 0 && T.theight > 0 && (T.tcolors == 3 || T.tcolors == 1)) {
+        const int w = T.twidth, h = T.theight, c = T.tcolors;
+        img = QImage(w, h, c == 3 ? QImage::Format_RGB888 : QImage::Format_Grayscale8);
+        for (int y = 0; y < h; ++y) {
+            uchar* dst = img.scanLine(y);
+            if (T.tformat == LIBRAW_THUMBNAIL_BITMAP) {
+                std::memcpy(dst, T.thumb + size_t(y) * w * c, size_t(w) * c);
+            } else {
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(T.thumb) + size_t(y) * w * c;
+                for (int i = 0; i < w * c; ++i) dst[i] = uchar(src[i] >> 8);
+            }
+        }
+    } else {
+        return fail(QStringLiteral("no usable embedded preview"));
+    }
+    if (img.isNull()) return fail(QStringLiteral("could not decode the embedded preview"));
+    if (!oriented) {
+        // LibRaw's flip describes the main image; the embedded preview is stored unrotated.
+        switch (proc.imgdata.sizes.flip) {
+            case 3: img = img.transformed(QTransform().rotate(180)); break;
+            case 5: img = img.transformed(QTransform().rotate(-90)); break;
+            case 6: img = img.transformed(QTransform().rotate(90)); break;
+            default: break;
+        }
+    }
+    if (std::max(img.width(), img.height()) > maxEdge) img = img.scaled(maxEdge, maxEdge, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    return img.convertToFormat(QImage::Format_RGB32);
 }
 
 }  // namespace re

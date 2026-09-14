@@ -25,6 +25,7 @@ private:
     QComboBox* aspect_;
     QPushButton* straightenBtn_;
     QPushButton* handlesBtn_;
+    QPushButton* guidesBtn_;
     QPushButton* cropBtn_;
     QLabel* cropInfo_;
 };

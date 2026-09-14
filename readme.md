@@ -1,9 +1,11 @@
 # rawedit
 
-A single-image raw developer with an ACR-style dialog, implemented from
-[raw-editor-spec.md](raw-editor-spec.md): open a raw file, fix lens distortion,
-perspective, crop, white balance and tone on the GPU, export with an embedded
-ICC profile and the source EXIF. No catalog, no sidecars, no persisted edits.
+A raw developer with an ACR-style dialog, implemented from
+[raw-editor-spec.md](raw-editor-spec.md): open one raw file or a handful, fix lens
+distortion, perspective, crop, white balance and tone on the GPU, copy the
+settings of one image to the others, export with an embedded ICC profile and the
+source EXIF. No catalog: the edit state of each raw lives in a JSON sidecar next to
+it (`DSC08912.ARW.json`), written automatically and read back when the file is opened.
 
 ## Build
 
@@ -14,7 +16,8 @@ Dependencies (Arch package names): `qt6-base`, `libraw`, `lensfun`
 ```sh
 meson setup build            # add --buildtype=release for an optimised build
 meson compile -C build
-./build/photoshop data/DSC08912.ARW
+./build/photoshop data/DSC08912.ARW              # one file
+./build/photoshop data/*.ARW                     # a set; a folder argument adds every raw in it
 ```
 
 Install system-wide (binary `photoshop` in `/usr/local/bin`, launcher entry, icon
@@ -47,26 +50,100 @@ display:
 QT_QPA_PLATFORM=offscreen ./build/photoshop file.ARW --screenshot shot.png   # window grab incl. GL canvas
 QT_QPA_PLATFORM=offscreen ./build/photoshop file.ARW --export out.tif        # default export (tif/jpg/png by extension)
 QT_QPA_PLATFORM=offscreen ./build/photoshop file.ARW --demo --screenshot s.png  # applies a set of edits + crop tool
+QT_QPA_PLATFORM=offscreen ./build/photoshop a.ARW b.ARW c.ARW --demo --sync --export outdir/ --format jpg
+    # several files: --sync copies the demo edits to the other images, an --export *folder* exports every
+    # image into it named after its raw (--format tif|jpg|png, default tif)
     --no-lens   disables the lens profile for the headless run
+    --reset     resets the active image to its defaults (removes its sidecar)
+    --auto      runs Auto tone on the active image and prints the resulting slider values
+    --guides "x1,y1,x2,y2;..."   adds upright guides (frame coordinates 0..1 of the loaded view) and applies them
+    # note that --demo, --sync and --auto write sidecars next to the files, like any edit
 ```
 
 ## Using it
 
 | Action | How |
 |---|---|
-| Open / export | `Ctrl+O`, `Ctrl+E` (or the Export… button) |
-| Undo / redo | `Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y` |
-| Reset everything | `R` |
+| Open / export | `Ctrl+O` (multi-select, or drop files/folders on the window; opening adds to what is loaded), `Ctrl+E` (or the Export… button) exports the selection: one image to a file, several into a folder |
+| Switch image | click a thumbnail in the filmstrip, `PgUp` / `PgDn`; the filmstrip appears with the second image |
+| Select images | `Ctrl`-click toggles a thumbnail, `Shift`-click extends from the active image, `Ctrl+A` selects all; the active image is always selected |
+| Close image | `Ctrl+W`, or the × on a hovered thumbnail; File → Close all |
+| Sync settings | `Ctrl+Shift+S` (or the Sync… button): copies groups of the active image's settings to every other loaded image, see below |
+| Export all | `Ctrl+Shift+E`: every image with the same format settings into one folder, named after its raw |
+| Undo / redo | `Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y` (per image; a sync is one step on each target) |
+| Auto tone | `Ctrl+U` or the Auto button in the Tone group: exposure, contrast, highlights, shadows and blacks from the histogram of the crop, see below |
+| Reset everything | `R` (the active image; also removes its sidecar) |
+| Edit state | saved automatically to `<raw>.json` next to the raw, see below |
 | Zoom | `0` fit, `1`–`4` for 25/50/100/200 %, wheel zooms at the cursor, `Ctrl` `+`/`-`, double-click toggles fit/100 % |
 | Tools | `H` hand, `C` crop, `A` straighten, `W` white-balance eyedropper, `P` perspective handles, `Esc` back to hand |
 | Crop | drag handles or draw a new rectangle; aspect from the Geometry panel; `X` swaps the aspect orientation; rule-of-thirds while dragging |
 | Straighten | drag a line along a horizon or a vertical; the nearer axis wins |
 | Perspective | drag the four corner handles, or use the Vertical/Horizontal keystone sliders |
+| Guides (upright) | `G`: draw two to four lines along things that should be vertical or horizontal; the perspective is corrected as soon as two exist and the crop follows; drag an end to adjust, right-click removes a guide, `Backspace` the last |
 | Before / after | hold `\`, or toggle with `B` |
 | Clipping overlay | `J` (blown highlights red, crushed blacks blue) |
 | Sliders | double-click resets to default, wheel nudges, the field takes typed values |
 | Auto-crop | Geometry and Lens panels: largest rectangle without empty corners, free or keeping the current aspect |
 | Display profile | File → Display profile (ICC)…; File → Display as sRGB |
+
+### Several images at once
+
+Every loaded file has its own decoded raw, lens profile, settings and undo history;
+the panels and tools always act on the active one. Files decode one at a time in the
+background (about 2 s each for a 10 MP ARW, decoded data stays in RAM: 6 bytes per
+pixel, so ~270 MB per 45 MP file — meant for a handful of images, not a whole shoot).
+The first file opened is shown as soon as it is decoded; clicking a thumbnail that is
+still queued moves it to the front of the queue and switches when it is ready.
+Thumbnails are the raws' embedded previews, so they show the file, not the edit.
+
+**Sidecars.** Every change is written, a quarter of a second after the last one, to a
+JSON file next to the raw (`DSC08912.ARW.json`), and the file is read back when the raw
+is opened. The raw itself is never touched. The values are the edit parameters verbatim
+(normalised frame coordinates, so they are resolution independent); nothing else can
+render them, which is why it is not an XMP file: the tone and lens models here do not
+map onto Camera Raw's. An image that is back at its as-shot defaults gets its sidecar
+removed, so an untouched folder stays clean. A sidecar that cannot be read (broken, or
+written by a newer format version) is left alone and the image's edits are not saved
+until it is fixed or removed; the status bar says so. Thumbnails of edited images carry
+a blue dot.
+
+**Auto tone** is the histogram-based kind, what Camera Raw's Auto was before it
+became a neural network. It renders the crop at 640 px and bisects each slider
+against a measured target on that render (about 100 renders of the tone stage, a
+few tens of milliseconds): exposure so the mean/median blend moves 80 % of the way
+to 0.45 (18 % grey encodes to 0.46; the missing 20 % keeps high-key and low-key
+scenes from being flattened to medium), highlights until at most 2 % of pixels sit
+above 0.94 and 0.3 % clip, shadows until at most 3 % sit below 0.06, blacks so the
+0.5th percentile lands at 0.02, contrast raised (never lowered, at most +35) halfway
+towards a 10–90 % spread of 0.6, then a second pass for exposure and the ends. Whites is reset
+to 0 and not solved: in this pipeline it is a plain gain, the same lever as
+exposure, so solving both would only make them fight. Because it measures the real
+render, curves you have set are accounted for, and the result is an ordinary edit:
+undoable, synced and saved like any other. Pressing it again gives the same values.
+Its known weakness is inherited from the original: scenes that should stay dark or
+bright are pulled towards medium, though only 80 % of the way.
+
+**Guides** are Lightroom's Guided Upright: each guide is a line in the picture that
+should end up exactly vertical or horizontal (the tool decides which from the angle
+you draw it at, blue for vertical, orange for horizontal). Two guides of one kind fix
+that direction's keystone and straighten the image; one of each squares the picture
+up without a keystone; two of each fix the full perspective. The maths is the
+vanishing-point construction: a pair of guides meets at a vanishing point, which the
+homography sends to infinity; the horizon through two such points becomes the line at
+infinity, and an affine step squares the directions up. The frame centre stays where
+it is and the scale there is unchanged, then the crop shrinks to the largest area
+without empty corners at the same aspect (auto-crop). The guides live in the edit
+state, so they are undoable, saved in the sidecar, part of Sync's Perspective group,
+and can be adjusted later. Straight lines have to be straight first: keep the lens
+profile on. Guides that converge inside the frame are refused with a message.
+
+**Sync** copies the active image's settings to all the others, by group, with one
+checkbox each: white balance, tone, curves, lens corrections, rotation, perspective,
+crop, output sharpening. Tone, curves, lens and output sharpening are on by default;
+white balance, rotation, perspective and crop are off because they are usually
+specific to one frame (white balance is safe to sync for shots in the same light: it
+is stored as an absolute temperature/tint, not as camera multipliers). The choice is
+remembered. An image that is still decoding receives the sync once it is ready.
 
 ## What the pipeline does
 
@@ -125,12 +202,18 @@ Intel UHD iGPU used for development a 45 MP source renders tone changes in
 ## Verification done
 
 - `test_core`: colour maths (neutral preservation for any illuminant, temp/tint
-  round trip, Bradford, working↔sRGB), PCHIP curve, history, homography and
-  frame geometry round trips, largest-inscribed-rectangle, lensfun matching and
-  grid evaluation.
+  round trip, Bradford, working↔sRGB), PCHIP curve, history, settings sync by
+  group, sidecar JSON and file round trips (exact, tolerant of missing and unknown
+  keys, rejects newer versions and broken curves), Guided Upright (a photographed
+  rectangle's edges come out vertical and horizontal to better than 0.001 px for
+  every guide combination, the centre stays put, crossing guides are refused),
+  homography and frame geometry round trips, largest-inscribed-rectangle, lensfun
+  matching and grid evaluation.
 - `test_gpu`: proxy vs full-res geometry (0.0006 px), proxy vs full-res pixels,
   bit-exact undo, histogram totals, identity mapping, neutral-grey level through
-  the whole chain, 45 MP timing.
+  the whole chain, Auto tone (reaches its brightness and black-point targets,
+  pulls back the highlights it blows, idempotent, leaves other settings alone,
+  gives a three-stops-darker source much more exposure), 45 MP timing.
 - Colour against a reference developer: with the lens profile off, the sRGB
   export of `data/DSC08912.ARW` differs from LibRaw's own `dcraw_emu -w -W -H 0 -o 1`
   rendering by a mean of 0.03 of an 8-bit step (99th percentile 0.15), i.e. the
@@ -162,13 +245,15 @@ Intel UHD iGPU used for development a 45 MP source renders tone changes in
   `Q_INIT_RESOURCE` before the first read; without that reference the linker
   discards the generated resource object and every shader fails to open.
 - Resize applies on export only. Output sharpening is previewed with its radius scaled by the zoom, so it is only judgeable at 100 % or more.
+- With several images loaded, all of them stay decoded in RAM (see above) and only the active one is on the GPU; Export all uploads each image in turn. Filmstrip thumbnails do not reflect the edits. Undo is per image, so undoing a sync means visiting each image. There is no live "auto sync" mode: Sync is a one-shot copy.
 
 ## Layout
 
 ```
-src/core    EditParams, ColourMath, CurveModel, History, Geometry, LensModel (lensfun), OutputProfiles (lcms2)
-src/io      RawLoader (LibRaw), MetadataReader (exiv2), Exporter (libtiff/libjpeg/libpng + exiv2)
+src/core    EditParams, ColourMath, CurveModel, History, Geometry, LensModel (lensfun), OutputProfiles (lcms2), AutoTone
+src/io      RawLoader (LibRaw), MetadataReader (exiv2), Exporter (libtiff/libjpeg/libpng + exiv2), Sidecar (JSON edit state)
 src/gpu     RenderBackend interface, GLBackend (GL 4.3 compute), ShaderProgram, TexturePool, shaders/
-src/ui      EditorSession, MainWindow, CanvasWidget, panels/, widgets/ (SliderRow, CurveEditor, Histogram)
+src/ui      EditorSession (the loaded documents + the active one), MainWindow, CanvasWidget, FilmstripWidget,
+            SyncDialog, ExportDialog, panels/, widgets/ (SliderRow, CurveEditor, Histogram)
 tests       test_core (CPU), test_gpu (offscreen GL)
 ```

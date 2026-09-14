@@ -1,4 +1,5 @@
 #include "ui/CanvasWidget.h"
+#include "core/AutoTone.h"
 #include "core/Geometry.h"
 #include "gpu/GLBackend.h"
 #include <QOpenGLContext>
@@ -114,16 +115,16 @@ void CanvasWidget::paintGL() {
     else if (!backendOk_) {
         painter.setPen(Qt::white);
         painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("OpenGL 4.3 compute shaders are not available on this system."));
-    } else if (!session_->isLoading()) {
+    } else {
         painter.setPen(QColor(150, 150, 150));
-        painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("Open a raw file  (Ctrl+O)"));
+        painter.drawText(rect(), Qt::AlignCenter, session_->isLoading() ? QStringLiteral("Decoding…") : QStringLiteral("Open raw files  (Ctrl+O)"));
     }
 }
 
 // ------------------------------------------------------------------ view maths
 
 QRectF CanvasWidget::viewCrop() const {
-    if (tool_ == Tool::Crop || tool_ == Tool::Straighten || tool_ == Tool::Perspective) return QRectF(0, 0, 1, 1);
+    if (tool_ == Tool::Crop || tool_ == Tool::Straighten || tool_ == Tool::Perspective || tool_ == Tool::Guides) return QRectF(0, 0, 1, 1);
     return session_->params().geom.cropNorm;
 }
 
@@ -287,21 +288,38 @@ void CanvasWidget::setDisplayLut(const std::vector<float>& lut, int n) {
     update();
 }
 
-bool CanvasWidget::renderForExport(const EditParams& params, Sampler sampler, ExportJob& job, const Exporter::Progress& progress, QString* error) {
-    if (!backendOk_ || !session_->hasImage()) { if (error) *error = QStringLiteral("no image"); return false; }
+bool CanvasWidget::renderForExport(const RawImage& img, const LensGrid& grid, const VignetteLut& vig, const EditParams& params, Sampler sampler,
+                                   ExportJob& job, const Exporter::Progress& progress, QString* error) {
+    if (!backendOk_) { if (error) *error = QStringLiteral("no GPU backend"); return false; }
     makeCurrent();
-    if (!sourceUploaded_) { backend_->setSource(*session_->image()); sourceUploaded_ = true; }
-    if (!lensUploaded_) uploadLensData();
+    const bool isActive = session_->hasImage() && session_->image().get() == &img;
+    if (!isActive || !sourceUploaded_) backend_->setSource(img);
+    if (!isActive || !lensUploaded_) { backend_->setLensGrid(grid); backend_->setVignetteLut(vig); }
     bool ok = Exporter::renderFullRes(*backend_, params, sampler, job, progress, error);
     backend_->releaseSlot(RenderBackend::SlotAux);
+    // The GPU now holds `img`, which is the canvas's image only if it is (still) the active one.
+    const bool stillActive = session_->hasImage() && session_->image().get() == &img;
+    sourceUploaded_ = lensUploaded_ = stillActive;
     doneCurrent();
     return ok;
 }
 
 void CanvasWidget::autoCropToFit(bool keepAspect) {
     if (!backendOk_ || !session_->hasImage()) return;
-    auto img = session_->image();
     EditParams p = session_->params();
+    QRectF crop;
+    QString msg;
+    if (!computeAutoCrop(p, keepAspect, &crop, &msg)) { emit statusMessage(msg); return; }
+    p.geom.cropNorm = crop;
+    session_->setParams(p, false);
+    auto img = session_->image();
+    emit statusMessage(QStringLiteral("cropped to %1 × %2 px").arg(std::lround(crop.width() * img->width)).arg(std::lround(crop.height() * img->height)));
+}
+
+bool CanvasWidget::computeAutoCrop(const EditParams& p, bool keepAspect, QRectF* crop, QString* message) {
+    auto fail = [&](const QString& m) { if (message) *message = m; return false; };
+    if (!backendOk_ || !session_->hasImage()) return fail(QStringLiteral("auto-crop: no image"));
+    auto img = session_->image();
     const int mw = 640;
     const int mh = std::max(8, int(std::lround(mw * double(img->height) / img->width)));
     makeCurrent();
@@ -321,7 +339,7 @@ void CanvasWidget::autoCropToFit(bool keepAspect) {
     bool ok = tex && backend_->readback(tex, mw, mh, rgba);
     backend_->releaseSlot(RenderBackend::SlotAux);
     doneCurrent();
-    if (!ok) { emit statusMessage(QStringLiteral("auto-crop: render failed")); return; }
+    if (!ok) return fail(QStringLiteral("auto-crop: render failed"));
     std::vector<uint8_t> mask(size_t(mw) * mh);
     for (size_t i = 0; i < mask.size(); ++i) mask[i] = rgba[i * 4 + 3] > 0.999f ? 1 : 0;
     double aspect = 0;
@@ -330,12 +348,108 @@ void CanvasWidget::autoCropToFit(bool keepAspect) {
         aspect = (c.width() * img->width) / (c.height() * img->height) * (double(mh) / img->height) / (double(mw) / img->width);
     }
     QRect r = geom::largestInscribedRect(mask, mw, mh, aspect);
-    if (r.isEmpty()) { emit statusMessage(QStringLiteral("auto-crop: no valid area found")); return; }
+    if (r.isEmpty()) return fail(QStringLiteral("auto-crop: no valid area found"));
     // shrink by one mask pixel for safety
     QRectF rn((r.x() + 0.5) / mw, (r.y() + 0.5) / mh, (r.width() - 1.0) / mw, (r.height() - 1.0) / mh);
-    p.geom.cropNorm = rn & QRectF(0, 0, 1, 1);
+    *crop = rn & QRectF(0, 0, 1, 1);
+    return true;
+}
+
+// ------------------------------------------------------------------ upright guides
+
+Vec2 CanvasWidget::screenToLens(QPointF s) const {
+    auto img = session_->image();
+    geom::FrameGeometry fg = geom::FrameGeometry::compute(session_->params().geom, img->width, img->height);
+    return fg.frameToLens(screenToFrame(s));
+}
+
+QPointF CanvasWidget::lensToScreen(QPointF lensPt) const {
+    auto img = session_->image();
+    geom::FrameGeometry fg = geom::FrameGeometry::compute(session_->params().geom, img->width, img->height);
+    return frameToScreen(fg.lensToFrame(Vec2(lensPt.x(), lensPt.y())));
+}
+
+int CanvasWidget::guideEndAt(QPointF s, const std::vector<Guide>& guides) const {
+    for (size_t i = 0; i < guides.size(); ++i)
+        for (int end = 0; end < 2; ++end) {
+            QPointF p = lensToScreen(end == 0 ? guides[i].a : guides[i].b);
+            if (std::hypot(p.x() - s.x(), p.y() - s.y()) <= 8) return int(i) * 2 + end;
+        }
+    return -1;
+}
+
+int CanvasWidget::guideAt(QPointF s, const std::vector<Guide>& guides) const {
+    for (size_t i = 0; i < guides.size(); ++i) {
+        QPointF a = lensToScreen(guides[i].a), b = lensToScreen(guides[i].b);
+        QPointF d = b - a;
+        double len2 = d.x() * d.x() + d.y() * d.y();
+        if (len2 < 1) continue;
+        double t = std::clamp(((s.x() - a.x()) * d.x() + (s.y() - a.y()) * d.y()) / len2, 0.0, 1.0);
+        QPointF q = a + d * t;
+        if (std::hypot(q.x() - s.x(), q.y() - s.y()) <= 6) return int(i);
+    }
+    return -1;
+}
+
+void CanvasWidget::applyGuides(std::vector<Guide> guides) {
+    if (!session_->hasImage()) return;
+    EditParams p = session_->params();
+    const bool hadCorrection = p.geom.guides.size() >= 2;
+    p.geom.guides = std::move(guides);
+    QString msg;
+    if (p.geom.guides.size() >= 2) {
+        std::array<QVector2D, 4> corners;
+        QString why;
+        if (geom::solveGuidedUpright(p.geom.guides, session_->image()->aspect(), p.geom.rotationDeg, &corners, &why)) {
+            p.geom.corners = corners;
+            p.geom.perspVertical = p.geom.perspHorizontal = 0;
+            QRectF crop;
+            if (computeAutoCrop(p, true, &crop, nullptr)) p.geom.cropNorm = crop;
+            int nv = 0;
+            for (const Guide& g : p.geom.guides) nv += g.vertical ? 1 : 0;
+            msg = QStringLiteral("guides: %1 vertical, %2 horizontal — perspective corrected").arg(nv).arg(int(p.geom.guides.size()) - nv);
+        } else {
+            msg = QStringLiteral("guides: %1").arg(why);
+        }
+    } else if (hadCorrection) {
+        p.geom.corners = {};
+        msg = QStringLiteral("guides: fewer than two left, correction removed");
+    }
     session_->setParams(p, false);
-    emit statusMessage(QStringLiteral("cropped to %1 × %2 px").arg(std::lround(rn.width() * img->width)).arg(std::lround(rn.height() * img->height)));
+    if (!msg.isEmpty()) emit statusMessage(msg);
+}
+
+void CanvasWidget::addGuidesFromFrame(const QList<QLineF>& lines) {
+    if (!session_->hasImage()) return;
+    auto img = session_->image();
+    geom::FrameGeometry fg = geom::FrameGeometry::compute(session_->params().geom, img->width, img->height);
+    std::vector<Guide> guides = session_->params().geom.guides;
+    for (const QLineF& l : lines) {
+        if (guides.size() >= 4) break;
+        Guide g;
+        Vec2 a = fg.frameToLens(Vec2(l.x1(), l.y1())), b = fg.frameToLens(Vec2(l.x2(), l.y2()));
+        g.a = QPointF(a.x, a.y);
+        g.b = QPointF(b.x, b.y);
+        g.vertical = std::abs(l.dy() * img->height) >= std::abs(l.dx() * img->width);
+        guides.push_back(g);
+    }
+    applyGuides(std::move(guides));
+}
+
+void CanvasWidget::autoTone() {
+    if (!backendOk_ || !session_->hasImage()) return;
+    makeCurrent();
+    if (!sourceUploaded_) { backend_->setSource(*session_->image()); sourceUploaded_ = true; }
+    if (!lensUploaded_) uploadLensData();
+    int renders = 0;
+    EditParams p = autotone::solve(*backend_, RenderBackend::SlotAux, histogramView(), session_->params(), {}, &renders);
+    backend_->releaseSlot(RenderBackend::SlotAux);
+    doneCurrent();
+    session_->setParams(p, false);
+    auto sgn = [](double v, int decimals) { return QStringLiteral("%1%2").arg(v > 0 ? QStringLiteral("+") : QString()).arg(v, 0, 'f', decimals); };
+    const ToneParams& t = p.tone;
+    emit statusMessage(QStringLiteral("auto tone: %1 EV, contrast %2, highlights %3, shadows %4, blacks %5")
+                           .arg(sgn(t.exposureEV, 2), sgn(t.contrast, 0), sgn(t.highlights, 0), sgn(t.shadows, 0), sgn(t.blacks, 0)));
 }
 
 // ------------------------------------------------------------------ tools
@@ -442,6 +556,7 @@ void CanvasWidget::updateCursor(QPointF s) {
         case Tool::WhiteBalance: setCursor(Qt::CrossCursor); break;
         case Tool::Straighten: setCursor(Qt::CrossCursor); break;
         case Tool::Perspective: setCursor(Qt::ArrowCursor); break;
+        case Tool::Guides: setCursor(session_->hasImage() && guideEndAt(s, session_->params().geom.guides) >= 0 ? Qt::PointingHandCursor : Qt::CrossCursor); break;
         case Tool::Crop: {
             int h = session_->hasImage() ? cropHandleAt(s) : -1;
             static const Qt::CursorShape shapes[8] = {Qt::SizeFDiagCursor, Qt::SizeVerCursor, Qt::SizeBDiagCursor, Qt::SizeHorCursor,
@@ -465,9 +580,24 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
         updateCursor(s);
         return;
     }
+    if (e->button() == Qt::RightButton && tool_ == Tool::Guides) {
+        std::vector<Guide> guides = session_->params().geom.guides;
+        int g = guideAt(s, guides);
+        if (g >= 0) { guides.erase(guides.begin() + g); applyGuides(std::move(guides)); }
+        return;
+    }
     if (e->button() != Qt::LeftButton) return;
     switch (tool_) {
         case Tool::WhiteBalance: pickWhiteBalance(s); break;
+        case Tool::Guides: {
+            const std::vector<Guide>& guides = session_->params().geom.guides;
+            int h = guideEndAt(s, guides);
+            if (h >= 0) { guideDraft_ = guides; guideEnd_ = h; drag_ = Drag::GuideEnd; }
+            else if (guides.size() < 4) { lineStart_ = lineEnd_ = s; drag_ = Drag::GuideNew; }
+            else emit statusMessage(QStringLiteral("four guides at most; right-click one to remove it"));
+            update();
+            break;
+        }
         case Tool::Straighten: lineStart_ = lineEnd_ = s; drag_ = Drag::Straighten; update(); break;
         case Tool::Crop: {
             int h = cropHandleAt(s);
@@ -509,6 +639,14 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
             break;
         }
         case Drag::Straighten: lineEnd_ = s; update(); break;
+        case Drag::GuideNew: lineEnd_ = s; update(); break;
+        case Drag::GuideEnd: {
+            Vec2 l = screenToLens(s);
+            Guide& g = guideDraft_[size_t(guideEnd_ / 2)];
+            (guideEnd_ % 2 == 0 ? g.a : g.b) = QPointF(l.x, l.y);
+            update();
+            break;
+        }
         case Drag::CropMove: {
             Vec2 a = screenToFrame(dragStart_), b = screenToFrame(s);
             QRectF r = cropStart_.translated(b.x - a.x, b.y - a.y);
@@ -571,6 +709,22 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* e) {
     drag_ = Drag::None;
     switch (d) {
         case Drag::Straighten: lineEnd_ = e->position(); applyStraighten(); break;
+        case Drag::GuideNew: {
+            lineEnd_ = e->position();
+            QPointF d = lineEnd_ - lineStart_;
+            if (std::hypot(d.x(), d.y()) >= 8) {
+                std::vector<Guide> guides = session_->params().geom.guides;
+                Guide g;
+                Vec2 a = screenToLens(lineStart_), b = screenToLens(lineEnd_);
+                g.a = QPointF(a.x, a.y);
+                g.b = QPointF(b.x, b.y);
+                g.vertical = std::abs(d.y()) >= std::abs(d.x());
+                guides.push_back(g);
+                applyGuides(std::move(guides));
+            }
+            break;
+        }
+        case Drag::GuideEnd: applyGuides(guideDraft_); guideDraft_.clear(); guideEnd_ = -1; break;
         case Drag::CropMove: case Drag::CropHandle: case Drag::CropNew: case Drag::Perspective: session_->commit(); break;
         default: break;
     }
@@ -602,6 +756,11 @@ void CanvasWidget::wheelEvent(QWheelEvent* e) {
 void CanvasWidget::keyPressEvent(QKeyEvent* e) {
     if (e->key() == Qt::Key_Escape && tool_ != Tool::Hand) { setTool(Tool::Hand); return; }
     if (e->key() == Qt::Key_X && tool_ == Tool::Crop) { swapCropOrientation(); return; }
+    if ((e->key() == Qt::Key_Backspace || e->key() == Qt::Key_Delete) && tool_ == Tool::Guides && session_->hasImage()) {
+        std::vector<Guide> guides = session_->params().geom.guides;
+        if (!guides.empty()) { guides.pop_back(); applyGuides(std::move(guides)); }
+        return;
+    }
     QOpenGLWidget::keyPressEvent(e);
 }
 
@@ -664,6 +823,47 @@ void CanvasWidget::drawOverlays(QPainter& p) {
             p.setBrush(i == perspHandle_ && drag_ == Drag::Perspective ? QColor(255, 200, 60) : QColor(120, 200, 255));
             p.drawEllipse(poly[i], 6, 6);
         }
+        p.setBrush(Qt::NoBrush);
+    }
+    if (tool_ == Tool::Guides) {
+        const QColor vertical(120, 200, 255), horizontal(255, 190, 80);
+        const std::vector<Guide>& guides = drag_ == Drag::GuideEnd ? guideDraft_ : params.geom.guides;
+        QRectF fr(frameToScreen({0, 0}), frameToScreen({1, 1}));
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(255, 255, 255, 90), 1, Qt::DashLine));
+        p.drawRect(fr);
+        for (size_t i = 0; i < guides.size(); ++i) {
+            const Guide& g = guides[i];
+            QPointF a = lensToScreen(g.a), b = lensToScreen(g.b);
+            QPointF d = b - a;
+            double len = std::hypot(d.x(), d.y());
+            const QColor col = g.vertical ? vertical : horizontal;
+            if (len > 1) {
+                QPointF u = d / len;  // the full line, faint, shows what the guide is aligned to
+                p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 70), 1, Qt::DashLine));
+                p.drawLine(a - u * 4000, b + u * 4000);
+            }
+            p.setPen(QPen(col, 2));
+            p.drawLine(a, b);
+            p.setPen(QPen(Qt::black, 1));
+            p.setBrush(col);
+            for (const QPointF& e : {a, b}) p.drawRect(QRectF(e.x() - 4, e.y() - 4, 8, 8));
+        }
+        if (drag_ == Drag::GuideNew) {
+            QPointF d = lineEnd_ - lineStart_;
+            const bool vert = std::abs(d.y()) >= std::abs(d.x());
+            p.setPen(QPen(vert ? vertical : horizontal, 2, Qt::DashLine));
+            p.drawLine(lineStart_, lineEnd_);
+            p.setPen(Qt::white);
+            p.drawText(lineEnd_ + QPointF(10, -10), vert ? QStringLiteral("vertical") : QStringLiteral("horizontal"));
+        }
+        p.setBrush(QColor(0, 0, 0, 150));
+        p.setPen(Qt::white);
+        QString hint = QStringLiteral("%1/4 guides · drag to add · drag an end to adjust · right-click removes · Backspace removes the last")
+                           .arg(params.geom.guides.size());
+        QRectF box(12, height() - 36, p.fontMetrics().horizontalAdvance(hint) + 16, 24);
+        p.drawRoundedRect(box, 4, 4);
+        p.drawText(box, Qt::AlignCenter, hint);
         p.setBrush(Qt::NoBrush);
     }
     if (beforeAfter_) {

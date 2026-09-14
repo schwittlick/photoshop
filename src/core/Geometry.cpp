@@ -1,6 +1,7 @@
 #include "core/Geometry.h"
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace re::geom {
 
@@ -64,6 +65,109 @@ Vec2 FrameGeometry::rotateFwd(Vec2 q) const {
 
 Vec2 FrameGeometry::frameToLens(Vec2 q) const { return invPersp.apply(rotateInv(q)); }
 Vec2 FrameGeometry::lensToFrame(Vec2 s) const { return rotateFwd(persp.apply(s)); }
+
+namespace {
+Vec3 cross(const Vec3& a, const Vec3& b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+}  // namespace
+
+bool solveGuidedUpright(const std::vector<Guide>& guides, double aspect, double rotationDeg, std::array<QVector2D, 4>* corners, QString* reason) {
+    auto fail = [&](const QString& r) { if (reason) *reason = r; return false; };
+    // Metric coordinates: origin at the frame centre, x scaled by the aspect (the space the rotation works in).
+    auto metric = [&](QPointF p) { return Vec3((p.x() - 0.5) * aspect, p.y() - 0.5, 1.0); };
+    std::vector<Vec3> vert, horz;  // homogeneous lines
+    for (const Guide& g : guides) {
+        Vec3 a = metric(g.a), b = metric(g.b);
+        if (std::hypot(a.x - b.x, a.y - b.y) < 1e-4) continue;
+        (g.vertical ? vert : horz).push_back(cross(a, b));
+    }
+    if (vert.size() + horz.size() < 2) return fail(QStringLiteral("draw at least two guides"));
+    if (vert.size() > 2) vert.resize(2);
+    if (horz.size() > 2) horz.resize(2);
+
+    // Vanishing point of each pair; a pair of coincident guides has none.
+    auto vanishing = [&](const std::vector<Vec3>& pair) -> std::optional<Vec3> {
+        if (pair.size() != 2) return std::nullopt;
+        Vec3 v = cross(pair[0], pair[1]);
+        double n = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        return n > 1e-12 ? std::optional<Vec3>(v / n) : std::nullopt;
+    };
+    std::optional<Vec3> vpV = vanishing(vert), vpH = vanishing(horz);
+    if (vert.size() == 2 && !vpV) return fail(QStringLiteral("the two vertical guides coincide"));
+    if (horz.size() == 2 && !vpH) return fail(QStringLiteral("the two horizontal guides coincide"));
+
+    // Projective part P = [1 0 0; 0 1 0; p1 p2 1]: sends each vanishing point to infinity (p . (vx, vy) = -vz).
+    double p1 = 0, p2 = 0;
+    if (vpV && vpH) {
+        double det = vpV->x * vpH->y - vpV->y * vpH->x;
+        if (std::abs(det) < 1e-9) return fail(QStringLiteral("both vanishing points line up with the frame centre"));
+        p1 = (-vpV->z * vpH->y + vpH->z * vpV->y) / det;
+        p2 = (-vpH->z * vpV->x + vpV->z * vpH->x) / det;
+    } else if (vpV || vpH) {
+        const Vec3& v = vpV ? *vpV : *vpH;
+        double n2 = v.x * v.x + v.y * v.y;
+        if (n2 < 1e-12) return fail(QStringLiteral("the guides cross at the frame centre"));
+        p1 = -v.z * v.x / n2;
+        p2 = -v.z * v.y / n2;
+    }
+    // The horizon (where P sends points to infinity) has to stay well outside the frame.
+    const double hw = 0.5 * aspect, hh = 0.5;
+    for (Vec2 c : {Vec2(-hw, -hh), Vec2(hw, -hh), Vec2(hw, hh), Vec2(-hw, hh)})
+        if (p1 * c.x + p2 * c.y + 1.0 < 0.2) return fail(QStringLiteral("the guides converge too strongly (they would meet inside the frame)"));
+    Mat3 P;
+    P.m[2][0] = p1;
+    P.m[2][1] = p2;
+
+    // Directions of the guides after P: a pair keeps its vanishing point's direction, a single line its own.
+    const Mat3 Pit = P.inverse().transposed();
+    auto lineDirection = [&](const Vec3& l) { Vec3 lp = Pit * l; return Vec2(lp.y, -lp.x); };
+    std::optional<Vec2> dV, dH;
+    if (vpV) dV = Vec2(vpV->x, vpV->y); else if (vert.size() == 1) dV = lineDirection(vert[0]);
+    if (vpH) dH = Vec2(vpH->x, vpH->y); else if (horz.size() == 1) dH = lineDirection(horz[0]);
+    if (dV) { if (dV->length() < 1e-12) return fail(QStringLiteral("degenerate vertical guides")); *dV = dV->normalized(); if (dV->y < 0) *dV = *dV * -1.0; }
+    if (dH) { if (dH->length() < 1e-12) return fail(QStringLiteral("degenerate horizontal guides")); *dH = dH->normalized(); if (dH->x < 0) *dH = *dH * -1.0; }
+
+    // Affine part: square the directions up. With one orientation only this is a pure rotation (the straightening).
+    Mat3 A;
+    if (dV && dH) {
+        double det = dH->x * dV->y - dH->y * dV->x;
+        if (std::abs(det) < 1e-3) return fail(QStringLiteral("vertical and horizontal guides are nearly parallel"));
+        A.m[0][0] = dV->y / det;  A.m[0][1] = -dV->x / det;
+        A.m[1][0] = -dH->y / det; A.m[1][1] = dH->x / det;
+    } else {
+        double phi = dV ? std::atan2(dV->x, dV->y) : -std::atan2(dH->y, dH->x);
+        A.m[0][0] = std::cos(phi); A.m[0][1] = -std::sin(phi);
+        A.m[1][0] = std::sin(phi); A.m[1][1] = std::cos(phi);
+    }
+    Mat3 H = A * P;
+    // Similarity: the frame centre stays put and the local scale there is one.
+    Vec2 c = H.apply(Vec2(0, 0));
+    Mat3 T;
+    T.m[0][2] = -c.x;
+    T.m[1][2] = -c.y;
+    H = T * H;
+    const double w = H.m[2][2];
+    if (std::abs(w) < 1e-12) return fail(QStringLiteral("degenerate correction"));
+    const double j00 = H.m[0][0] / w, j01 = H.m[0][1] / w, j10 = H.m[1][0] / w, j11 = H.m[1][1] / w;  // centre maps to the origin
+    const double dj = j00 * j11 - j01 * j10;
+    if (dj <= 1e-9) return fail(QStringLiteral("the correction would mirror the image"));
+    H = Mat3::diag(Vec3(1.0 / std::sqrt(dj), 1.0 / std::sqrt(dj), 1.0)) * H;
+
+    // The rotation is applied after the perspective: persp = R^-1 H in metric space, then back to frame coordinates.
+    const double th = rotationDeg * kPi / 180.0;
+    Mat3 Rinv;
+    Rinv.m[0][0] = std::cos(th); Rinv.m[0][1] = std::sin(th);
+    Rinv.m[1][0] = -std::sin(th); Rinv.m[1][1] = std::cos(th);
+    Mat3 N;  // frame -> metric
+    N.m[0][0] = aspect; N.m[0][2] = -0.5 * aspect; N.m[1][2] = -0.5;
+    const Mat3 persp = N.inverse() * (Rinv * H) * N;
+    const Vec2 unit[4] = {Vec2(0, 0), Vec2(1, 0), Vec2(1, 1), Vec2(0, 1)};
+    for (int i = 0; i < 4; ++i) {
+        Vec3 h = persp * Vec3(unit[i].x, unit[i].y, 1.0);
+        if (h.z < 1e-6) return fail(QStringLiteral("the correction would fold the frame over"));
+        (*corners)[size_t(i)] = QVector2D(float(h.x / h.z - unit[i].x), float(h.y / h.z - unit[i].y));
+    }
+    return true;
+}
 
 Vec2 manualDistortion(Vec2 q, double aspect, double a, double b, double c, double chScale) {
     double hdl = 0.5 * std::sqrt(aspect * aspect + 1.0);

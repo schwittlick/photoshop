@@ -6,6 +6,8 @@
 #include "core/EditParams.h"
 #include "core/Math.h"
 #include <QRect>
+#include <QString>
+#include <QVector2D>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -30,6 +32,13 @@ struct FrameGeometry {
     Vec2 frameToLens(Vec2 q) const;  // inverse chain used by the shader
     Vec2 lensToFrame(Vec2 s) const;  // forward chain
 };
+
+// Guided Upright. Solves the corner offsets (with the keystone sliders at zero) that make the guides exactly
+// vertical / horizontal once the existing rotation is applied on top: two guides of one orientation give the
+// keystone plus the straightening, one of each an affine squaring-up, two of each the full perspective. The
+// frame centre stays put and the scale there is unchanged. False, with a reason, when fewer than two usable
+// guides exist, the guides converge inside the frame, or the result would fold over.
+bool solveGuidedUpright(const std::vector<Guide>& guides, double aspect, double rotationDeg, std::array<QVector2D, 4>* corners, QString* reason);
 
 // Manual ptlens distortion plus per-channel radial scale (CA); r normalised to half the diagonal.
 // Keep in sync with manualDist() in warp.comp.

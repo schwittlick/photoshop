@@ -51,10 +51,18 @@ struct LensParams {
     bool operator==(const LensParams&) const = default;
 };
 
+// A Guided Upright line: something in the picture that should end up exactly vertical or horizontal.
+struct Guide {
+    QPointF a, b;          // lens-corrected frame coordinates (0..1), i.e. before rotation and perspective
+    bool vertical = true;  // false = should be horizontal
+    bool operator==(const Guide&) const = default;
+};
+
 struct GeometryParams {
     float rotationDeg = 0.f;                         // positive = clockwise on screen, -45..45
     std::array<QVector2D, 4> corners{};              // perspective handles: normalised offsets TL, TR, BR, BL
     float perspVertical = 0.f, perspHorizontal = 0.f;  // -100..100 keystone sliders, composed with corners
+    std::vector<Guide> guides;                       // at most 4; with two or more, `corners` is solved from them
     QRectF cropNorm{0, 0, 1, 1};                     // normalised crop in the corrected frame
     bool operator==(const GeometryParams&) const = default;
 };
@@ -68,5 +76,24 @@ struct EditParams {
     float outputSharpenRadius = 0.8f; // pixels
     bool operator==(const EditParams&) const = default;
 };
+
+// Which groups of settings "Sync" copies from one image to the others. The groups follow the
+// panels. Crop, rotation, perspective and white balance are off by default because they are
+// usually specific to a single frame.
+struct SyncMask {
+    bool whiteBalance = false;
+    bool tone = true;           // Basic panel: exposure .. blacks, vibrance, saturation
+    bool curves = true;         // Curve panel: point curves and parametric regions
+    bool lens = true;           // Lens panel: profile switches and manual corrections
+    bool rotation = false;      // straighten angle
+    bool perspective = false;   // corner handles and keystone sliders
+    bool crop = false;
+    bool outputSharpen = true;  // Detail panel
+    bool operator==(const SyncMask&) const = default;
+    bool any() const { return whiteBalance || tone || curves || lens || rotation || perspective || crop || outputSharpen; }
+};
+
+// `dst` with the groups selected in `mask` replaced by the values from `src`.
+EditParams applySync(const EditParams& src, const EditParams& dst, const SyncMask& mask);
 
 }  // namespace re

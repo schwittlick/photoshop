@@ -36,16 +36,24 @@ GeometryPanel::GeometryPanel(EditorSession* session, QWidget* parent) : PanelBas
     handles->setCheckable(true);
     handlesBtn_ = handles;
     handles->setToolTip(QStringLiteral("Drag the four corners of the frame freely (P)"));
+    auto* guides = new QPushButton(QStringLiteral("Guides"), this);
+    guides->setCheckable(true);
+    guidesBtn_ = guides;
+    guides->setToolTip(QStringLiteral("Draw lines along things that should be vertical or horizontal (G): two of one kind, or two of each. "
+                                      "The perspective follows as soon as two exist; right-click removes a guide."));
     auto* resetP = new QPushButton(QStringLiteral("Reset"), this);
     pRow->addWidget(handles);
+    pRow->addWidget(guides);
     pRow->addWidget(resetP);
     pRow->addStretch();
     persp->contentLayout()->addLayout(pRow);
     connect(handles, &QPushButton::clicked, this, [this] { emit toolRequested(Tool::Perspective); });
+    connect(guides, &QPushButton::clicked, this, [this] { emit toolRequested(Tool::Guides); });
     connect(resetP, &QPushButton::clicked, this, [this] {
         EditParams p = session_->params();
         p.geom.corners = {};
         p.geom.perspVertical = p.geom.perspHorizontal = 0;
+        p.geom.guides.clear();
         session_->setParams(p, false);
     });
     lay->addWidget(persp);
@@ -95,11 +103,12 @@ GeometryPanel::GeometryPanel(EditorSession* session, QWidget* parent) : PanelBas
 }
 
 void GeometryPanel::setActiveTool(Tool t) {
-    for (auto* b : {straightenBtn_, handlesBtn_, cropBtn_}) b->blockSignals(true);
+    for (auto* b : {straightenBtn_, handlesBtn_, guidesBtn_, cropBtn_}) b->blockSignals(true);
     straightenBtn_->setChecked(t == Tool::Straighten);
     handlesBtn_->setChecked(t == Tool::Perspective);
+    guidesBtn_->setChecked(t == Tool::Guides);
     cropBtn_->setChecked(t == Tool::Crop);
-    for (auto* b : {straightenBtn_, handlesBtn_, cropBtn_}) b->blockSignals(false);
+    for (auto* b : {straightenBtn_, handlesBtn_, guidesBtn_, cropBtn_}) b->blockSignals(false);
 }
 
 void GeometryPanel::setCropAspect(CropAspect a) {

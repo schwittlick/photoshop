@@ -2,7 +2,7 @@
 // Shared UI enums (kept free of widget dependencies so panels can signal them).
 namespace re {
 
-enum class Tool { Hand = 0, Crop, Straighten, WhiteBalance, Perspective };
+enum class Tool { Hand = 0, Crop, Straighten, WhiteBalance, Perspective, Guides };
 enum class CropAspect { Free = 0, Original, Square, R4x3, R3x2, R16x9 };
 
 // Constraint aspect as width/height in pixels, oriented like the frame; 0 = unconstrained.

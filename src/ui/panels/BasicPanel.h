@@ -11,6 +11,7 @@ public:
     explicit BasicPanel(EditorSession* session, QWidget* parent = nullptr);
 signals:
     void whiteBalancePickerRequested();
+    void autoToneRequested();
 };
 
 }  // namespace re

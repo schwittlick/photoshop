@@ -1,5 +1,6 @@
 // GPU tests (offscreen context): proxy/full-res geometric agreement (spec §3.2),
 // undo exactness, histogram consistency.
+#include "core/AutoTone.h"
 #include "core/Geometry.h"
 #include "gpu/GLBackend.h"
 #include "io/RawImage.h"
@@ -30,6 +31,29 @@ static RawImage makeSynthetic(int W, int H) {
             uint16_t v = line ? 60000 : base;
             uint16_t* p = &img.rgb[(size_t(y) * W + x) * 3];
             p[0] = v; p[1] = uint16_t(line ? 60000 : base / 2); p[2] = uint16_t(line ? 60000 : base / 3);
+        }
+    img.camera = colour::CameraColour::fallbackSRGB();
+    return img;
+}
+
+// Scene-like source for Auto tone: a gamma-shaped gradient with a dark band (shadows) and a thin bright
+// "light source" that does not scale, so that real blacks exist and highlights get blown once the exposure
+// solve brightens the rest. `scale` under-exposes the gradient.
+static RawImage makeScene(int W, int H, double scale) {
+    RawImage img;
+    img.width = W;
+    img.height = H;
+    img.rgb.resize(size_t(W) * H * 3);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            double v = std::pow(x / (W - 1.0), 2.2) * 0.85 + 0.005;
+            v *= scale;
+            if (y < H / 8) v *= 0.15;
+            else if (y > H - H / 100) v = 0.9;
+            uint16_t* p = &img.rgb[(size_t(y) * W + x) * 3];
+            p[0] = uint16_t(std::lround(std::min(1.0, v) * 65535));
+            p[1] = uint16_t(std::lround(std::min(1.0, v * 0.9) * 65535));
+            p[2] = uint16_t(std::lround(std::min(1.0, v * 0.8) * 65535));
         }
     img.camera = colour::CameraColour::fallbackSRGB();
     return img;
@@ -246,6 +270,55 @@ int main(int argc, char** argv) {
         std::vector<float> c;
         CHECK(be.readback(be.render(RenderBackend::SlotAux, sv, sp, tiny), 512, 384, c));
         CHECK(c == a);
+    }
+
+    // ---- Test 6c: Auto tone reaches its targets, is a function of the image alone, and brightens a dark one.
+    std::printf("auto tone\n");
+    {
+        RawImage scene = makeScene(W, H, 0.5);
+        be.setSource(scene);
+        EditParams ap;
+        ViewSpec av{512, 384, QRectF(0, 0, 1, 1), QRectF(0, 0, 1, 1), 2};
+        RenderOptions ho;
+        ho.histogram = true;
+        autotone::Targets T;
+        HistogramData h0;
+        be.render(RenderBackend::SlotAux, av, ap, ho, &h0);
+        const autotone::Stats s0 = autotone::statsFrom(h0);
+        const double midTarget = s0.mid() + T.midPull * (T.mid - s0.mid());
+        int renders = 0;
+        QElapsedTimer at;
+        at.start();
+        EditParams a1 = autotone::solve(be, RenderBackend::SlotAux, av, ap, T, &renders);
+        const qint64 ms = at.elapsed();
+        HistogramData h1;
+        be.render(RenderBackend::SlotAux, av, a1, ho, &h1);
+        const autotone::Stats s1 = autotone::statsFrom(h1);
+        std::printf("  %d renders in %lld ms: exposure %+.2f EV contrast %+.0f highlights %+.0f shadows %+.0f blacks %+.0f\n", renders, ms,
+                    a1.tone.exposureEV, a1.tone.contrast, a1.tone.highlights, a1.tone.shadows, a1.tone.blacks);
+        std::printf("  mid %.3f -> %.3f (target %.3f), p0.5 %.3f -> %.3f, clipped %.4f -> %.4f, above 0.94 %.3f -> %.3f, spread %.3f -> %.3f\n",
+                    s0.mid(), s1.mid(), midTarget, s0.p05, s1.p05, s0.clipHigh, s1.clipHigh, s0.highMass, s1.highMass, s0.p90 - s0.p10, s1.p90 - s1.p10);
+        CHECK(std::abs(s1.mid() - midTarget) < 0.04);
+        CHECK(std::abs(s1.p05 - T.black) < 0.03);
+        CHECK(s1.clipHigh <= T.highlightClip + 0.002);  // the exposure lift blew the light source; Highlights pulled it back
+        CHECK(s1.highMass <= T.highlightMass + 0.01);
+        CHECK(a1.tone.whites == 0 && a1.tone.highlights < 0 && a1.tone.contrast >= 0 && a1.tone.exposureEV > 0.3f);
+        CHECK(renders < 200 && ms < 3000);
+        // Auto on its own result gives the same answer: the sliders are solved from the image, not nudged.
+        EditParams a2 = autotone::solve(be, RenderBackend::SlotAux, av, a1, T);
+        CHECK(std::abs(a2.tone.exposureEV - a1.tone.exposureEV) < 0.02 && a2.tone.contrast == a1.tone.contrast && a2.tone.blacks == a1.tone.blacks && a2.tone.whites == a1.tone.whites);
+        // Everything outside the six sliders is untouched.
+        EditParams keep = ap;
+        keep.wb.temp = 3333; keep.tone.vibrance = 17; keep.geom.rotationDeg = 1.5f; keep.tone.curveMaster.pts = {QPointF(0, 0), QPointF(0.5, 0.45), QPointF(1, 1)};
+        EditParams a3 = autotone::solve(be, RenderBackend::SlotAux, av, keep, T);
+        CHECK(a3.wb == keep.wb && a3.tone.vibrance == 17 && a3.geom == keep.geom && a3.tone.curveMaster == keep.tone.curveMaster && a3.lens == keep.lens);
+        // A source three stops darker gets much more exposure.
+        RawImage dark = makeScene(W, H, 0.5 / 8);
+        be.setSource(dark);
+        EditParams a4 = autotone::solve(be, RenderBackend::SlotAux, av, ap, T);
+        std::printf("  dark source: exposure %+.2f EV (bright: %+.2f)\n", a4.tone.exposureEV, a1.tone.exposureEV);
+        CHECK(a4.tone.exposureEV > a1.tone.exposureEV + 1.5);
+        be.setSource(img);
     }
 
     // ---- Test 7: interactive cost on a 45 MP source (viewport-sized passes, so it must not scale with the file).

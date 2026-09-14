@@ -32,6 +32,13 @@ BasicPanel::BasicPanel(EditorSession* session, QWidget* parent) : PanelBase(sess
     lay->addWidget(wb);
 
     auto* tone = new CollapsibleGroup(QStringLiteral("Tone"), this);
+    auto* autoRow = new QHBoxLayout();
+    auto* autoBtn = new QPushButton(QStringLiteral("Auto"), this);
+    autoBtn->setToolTip(QStringLiteral("Set exposure, contrast, highlights, shadows and blacks from the histogram of the crop (Ctrl+U)"));
+    autoRow->addStretch();
+    autoRow->addWidget(autoBtn);
+    tone->contentLayout()->addLayout(autoRow);
+    connect(autoBtn, &QPushButton::clicked, this, &BasicPanel::autoToneRequested);
     addSlider(tone->contentLayout(), QStringLiteral("Exposure"), -5, 5, 0.01, 2, [](EditParams& p) -> float& { return p.tone.exposureEV; })
         ->setSuffix(QStringLiteral(" EV"));
     addSlider(tone->contentLayout(), QStringLiteral("Contrast"), -100, 100, 1, 0, [](EditParams& p) -> float& { return p.tone.contrast; });
